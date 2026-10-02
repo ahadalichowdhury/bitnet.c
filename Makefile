@@ -1,6 +1,7 @@
 # bitnet.c — BitNet b1.58 inference engine for Apple Silicon (pure C11 + ARM NEON)
 #
-#   make            build the `bitnet` CLI, libbitnet.a and all test programs
+#   make            build the `bitnet` CLI, libbitnet.a/.dylib/.so and all test programs
+#   make lib        static + shared library (build/libbitnet.a, build/libbitnet.{dylib,so})
 #   make bitnet     build the CLI only
 #   make test       run every verification suite (all module suites + public API)
 #   make bench      ./bitnet --bench (TTFT, prefill/decode tok/s, memory)
@@ -42,6 +43,13 @@ OBJ   := $(BUILD)/obj
 LIB_SRC := src/bitnet.c src/generate.c src/transformer.c src/threadpool.c src/model_loader.c src/tokenizer.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(OBJ)/%.o)
 LIB     := $(BUILD)/libbitnet.a
+ifeq ($(shell uname -s),Darwin)
+SHLIB       := $(BUILD)/libbitnet.dylib
+SHLIB_FLAGS := -dynamiclib -install_name @rpath/libbitnet.dylib
+else
+SHLIB       := $(BUILD)/libbitnet.so
+SHLIB_FLAGS := -shared -Wl,-soname,libbitnet.so
+endif
 
 TESTS := $(BUILD)/test_dot_product $(BUILD)/test_gemv $(BUILD)/test_bitlinear \
          $(BUILD)/test_loader $(BUILD)/test_tokenizer $(BUILD)/test_transformer \
@@ -51,16 +59,18 @@ TESTS := $(BUILD)/test_dot_product $(BUILD)/test_gemv $(BUILD)/test_bitlinear \
 
 all: bitnet lib tests
 
-lib: $(LIB)
+lib: $(LIB) $(SHLIB)
 tests: $(TESTS)
 
 # ---- objects / library ----------------------------------------------------
 
-$(OBJ)/%.o: src/%.c | $(OBJ)
+# Engine objects are position-independent (shared library) and hide every
+# symbol except the BITNET_API functions of include/bitnet.h.
+$(OBJ)/%.o: src/%.c Makefile | $(OBJ)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -fvisibility=hidden $(DEPFLAGS) -c $< -o $@
+$(OBJ)/%.o: tests/%.c Makefile | $(OBJ)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
-$(OBJ)/%.o: tests/%.c | $(OBJ)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
-$(OBJ)/main.o: app/main.c | $(OBJ)
+$(OBJ)/main.o: app/main.c Makefile | $(OBJ)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OBJ) $(BUILD):
@@ -68,6 +78,9 @@ $(OBJ) $(BUILD):
 
 $(LIB): $(LIB_OBJ)
 	ar rcs $@ $^
+
+$(SHLIB): $(LIB_OBJ)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $^ -lpthread -lm -o $@
 
 # The CLI binary: ./bitnet
 bitnet: $(OBJ)/main.o $(LIB)
