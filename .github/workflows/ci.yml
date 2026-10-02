@@ -19,11 +19,13 @@ jobs:
       - name: AVX2 vs scalar bit-identity (mock model logits)
         run: |
           grep -m1 -o "AVX2 ([^)]*)" <(build/test_dot_product)          # the AVX2 path is the one running
-          make BUILD=build-scalar CFLAGS="-O3 -march=native -mavx2 -mfma -Wall -Wextra -std=c11 -DBITNET_FORCE_SCALAR" \
-               build-scalar/test_transformer build-scalar/test_dot_product
+          F="-O3 -march=native -mavx2 -mfma -mf16c -Wall -Wextra -std=c11"
+          make BUILD=build-scalar CFLAGS="$F -DBITNET_FORCE_SCALAR" build-scalar/test_transformer build-scalar/test_dot_product
           build-scalar/test_dot_product | grep -m1 "scalar (no SIMD)"
+          # Integer AVX2 kernels must be exact: compare with F16C off (F16C reorders the float16 sum).
+          make BUILD=build-avx2-exact CFLAGS="$F -DBITNET_NO_F16C" build-avx2-exact/test_transformer
           T=models/hf/bitnet-b1.58-2B-4T/tokenizer.json
-          build/test_transformer build/mock/mock.bitnet $T build/mock/mock.ref_logits --no-unit-tests --dump-logits avx2.f32 | grep "Logits dump"
+          build-avx2-exact/test_transformer build/mock/mock.bitnet $T build/mock/mock.ref_logits --no-unit-tests --dump-logits avx2.f32 | grep "Logits dump"
           build-scalar/test_transformer build/mock/mock.bitnet $T build/mock/mock.ref_logits --no-unit-tests --dump-logits scalar.f32 | grep "Logits dump"
           cmp avx2.f32 scalar.f32 && echo "AVX2 and scalar logits are bit-identical ($(wc -c < avx2.f32) bytes)"
       - name: Shared library + Python bindings
