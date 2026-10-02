@@ -33,7 +33,6 @@
 #include <string.h>
 #include <time.h>
 
-#include <malloc/malloc.h>
 #include <unistd.h>
 
 #include "model_loader.h"
