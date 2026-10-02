@@ -33,6 +33,11 @@
 
 typedef bitnet_model BitNetModel;
 
+/* Prompt tokens per batched forward chunk (activation buffers scale with it). */
+#ifndef TRANSFORMER_BATCH
+#define TRANSFORMER_BATCH 16
+#endif
+
 /* Per-stage wall time accumulated by transformer_forward (nanoseconds). */
 typedef struct {
     uint64_t embed, attn_proj, attention, ffn, logits, total;
@@ -42,6 +47,8 @@ typedef struct {
 typedef struct {
     int max_seq_len; /* KV-cache capacity in positions */
 
+    /* Per-token buffers have TRANSFORMER_BATCH rows of the given width (batched
+     * prefill); a single-token pass uses row 0. */
     float   *x;      /* [dim]          residual stream */
     float   *xb;     /* [dim]          normed input / sub-layer output */
     float   *xb2;    /* [q_dim]        attention output (per head, concatenated) */
@@ -50,8 +57,9 @@ typedef struct {
     float   *hb;     /* [hidden_dim]   gate activations */
     float   *hb2;    /* [hidden_dim]   up activations */
     float   *logits; /* [vocab_size] */
-    int8_t  *xq;     /* [max(dim, hidden_dim, q_dim)] quantized activations */
-    int32_t *yi;     /* [q_dim + 2*kv_dim + 2*hidden_dim] int32 GEMV outputs */
+    int8_t  *xq;     /* rows of xq_stride >= max(dim, hidden_dim, q_dim): quantized activations */
+    int32_t *yi;     /* rows of yi_stride = q_dim + 2*kv_dim + 2*hidden_dim + dim: int32 outputs */
+    size_t   xq_stride, yi_stride;
 
     float   *key_cache;   /* [n_layers][max_seq_len][kv_dim] */
     float   *value_cache; /* [n_layers][max_seq_len][kv_dim] */
@@ -83,6 +91,13 @@ void transformer_forward(int token_id, int pos, const BitNetModel *model, RunSta
  * needed: the 128256 x 2560 output layer is ~40% of a forward pass. */
 void transformer_forward_ex(int token_id, int pos, const BitNetModel *model, RunState *s,
                             int compute_logits);
+
+/* Prompt prefill: tokens[0..n) at positions pos..pos+n-1, processed in chunks
+ * of TRANSFORMER_BATCH tokens so each ternary weight block is decoded once
+ * per GEMM_TB tokens (gemv.h). Logits (if requested) are for the last token.
+ * KV cache and logits are bit-identical to n transformer_forward_ex calls. */
+void transformer_forward_batch(const int32_t *tokens, int n, int pos, const BitNetModel *model,
+                               RunState *s, int compute_logits);
 
 /* ---- Building blocks (exposed for unit tests) --------------------------- */
 

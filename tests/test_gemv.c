@@ -382,6 +382,79 @@ static void run_i128_verification(void) {
            "tails, -128 activations, reserved codes)\n", cases);
 }
 
+/* Batched GEMM (prefill) == per-token scalar GEMV, both layouts, every
+ * token count 1..GEMM_MAX_T incl. ragged GEMM_TB groups, K tails and tiles. */
+static void run_gemm_verification(void) {
+    static const struct { int M, K; } shapes[] = {
+        {1, 128}, {3, 1}, {5, 129}, {7, 255}, {33, 640}, {4, 2560}, {64, GEMV_K_TILE + 1},
+        {37, 3 * GEMV_K_TILE + 17}, {100, 6912},
+    };
+    enum { MAX_M = 100, MAX_K = 6912, AS = MAX_K + 64 };
+    int8_t  *act = aligned_buf((size_t)GEMM_MAX_T * AS);
+    uint8_t *w4 = aligned_buf(matrix_bytes(MAX_M, MAX_K));
+    uint8_t *w128 = aligned_buf((size_t)MAX_M * ternary_row_bytes(MAX_K, TERNARY_I128));
+    int32_t *ref = aligned_buf((size_t)GEMM_MAX_T * MAX_M * 4), *got = aligned_buf((size_t)GEMM_MAX_T * MAX_M * 4);
+    int cases = 0;
+    for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+        const int M = shapes[si].M, K = shapes[si].K;
+        for (int T = 1; T <= GEMM_MAX_T; T += (T < 10 ? 1 : 7)) {
+            for (int t = 0; t < GEMM_MAX_T; t++) fill_act_random(act + (size_t)t * AS, K);
+            if (T % 3 == 0) memset(act, -128, (size_t)K); /* extreme activations in token 0 */
+            fill_weights_random(w4, M, K);
+            repack_i128(w4, w128, M, K);
+            for (int L = 0; L < 2; L++) {
+                const ternary_layout lay = L ? TERNARY_I128 : TERNARY_ROW4;
+                for (int t = 0; t < T; t++)
+                    gemv_scalar_layout(act + (size_t)t * AS, L ? w128 : w4, ref + (size_t)t * MAX_M, M, K, lay);
+                memset(got, 0x55, (size_t)GEMM_MAX_T * MAX_M * 4);
+                gemm_bitnet_layout(act, AS, T, L ? w128 : w4, got, MAX_M, M, K, lay);
+                for (int t = 0; t < T; t++)
+                    for (int m = 0; m < M; m++) {
+                        if (got[(size_t)t * MAX_M + m] != ref[(size_t)t * MAX_M + m])
+                            fprintf(stderr, "GEMM MISMATCH %s M=%d K=%d T=%d t=%d m=%d: %d != %d\n",
+                                    L ? "I128" : "ROW4", M, K, T, t, m, got[(size_t)t * MAX_M + m],
+                                    ref[(size_t)t * MAX_M + m]);
+                        assert(got[(size_t)t * MAX_M + m] == ref[(size_t)t * MAX_M + m]);
+                    }
+                cases++;
+            }
+        }
+    }
+    free(act); free(w4); free(w128); free(ref); free(got);
+    printf("Batched GEMM:   PASSED (%d cases: == per-token scalar GEMV, ROW4 + I128, T = 1..%d "
+           "tokens, K tails / tiles, -128 activations)\n", cases, GEMM_MAX_T);
+}
+
+/* T separate GEMVs vs one batched GEMM over the same weights (prefill). */
+static void run_gemm_benchmark(int quick) {
+    enum { M = 4096, K = 4096, T = 16 };
+    int8_t *act = aligned_buf((size_t)T * K);
+    uint8_t *w4 = aligned_buf(matrix_bytes(M, K));
+    uint8_t *w128 = aligned_buf((size_t)M * ternary_row_bytes(K, TERNARY_I128));
+    int32_t *out = aligned_buf((size_t)T * M * 4);
+    for (int t = 0; t < T; t++) fill_act_random(act + (size_t)t * K, K);
+    fill_weights_random(w4, M, K);
+    repack_i128(w4, w128, M, K);
+    const int calls = quick ? 3 : 30;
+    double best[2] = {1e30, 1e30};
+    for (int v = 0; v < 2; v++)
+        for (int i = 0; i < calls; i++) {
+            const uint64_t t0 = now_ns();
+            if (v == 0)
+                for (int t = 0; t < T; t++)
+                    gemv_bitnet_layout(act + (size_t)t * K, w128, out + (size_t)t * M, M, K, TERNARY_I128, 0);
+            else
+                gemm_bitnet_layout(act, K, T, w128, out, M, M, K, TERNARY_I128);
+            __asm__ volatile("" : : "r"(out) : "memory");
+            const double ms = (double)(now_ns() - t0) / 1e6;
+            best[v] = ms < best[v] ? ms : best[v];
+        }
+    printf("\nBatched GEMM: M=%d K=%d, %d tokens, I128, 1 thread, best of %d\n", M, K, T, calls);
+    printf("  %d x GEMV     %8.3f ms  (%.3f ms/token)\n", T, best[0], best[0] / T);
+    printf("  GEMM          %8.3f ms  (%.3f ms/token)  %.2fx\n", best[1], best[1] / T, best[0] / best[1]);
+    free(act); free(w4); free(w128); free(out);
+}
+
 static float rand_unit(void) { return (float)(xorshift64() >> 40) / (float)(1u << 24); }
 
 /* Q8 output-layer kernels (q8.h): quantizer properties, and SIMD == scalar
@@ -543,8 +616,10 @@ int main(int argc, char **argv) {
     run_verification();
     run_i128_verification();
     run_q8_verification();
+    run_gemm_verification();
     run_benchmark(quick);
     run_layout_benchmark(quick);
     run_q8_benchmark(quick);
+    run_gemm_benchmark(quick);
     return 0;
 }

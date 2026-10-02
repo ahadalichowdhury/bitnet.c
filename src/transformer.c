@@ -31,6 +31,8 @@
 /* Rows per work item for the f16 output projection. */
 #define F16_ROW_BLOCK 64
 
+_Static_assert(TRANSFORMER_BATCH >= 1 && TRANSFORMER_BATCH <= GEMM_MAX_T, "TRANSFORMER_BATCH must be in [1, GEMM_MAX_T]");
+
 static inline uint64_t now_ns(void) { return platform_now_ns(); }
 
 /* ========================================================================= */
@@ -394,27 +396,61 @@ static void multi_gemv_block(void *ctx_, size_t b) {
     gemv_row_block(&m->c[i], b - m->first_blk[i]);
 }
 
-/* For each i: out[i] = BitLinear(W[i], xq) with activation scale gamma.
+typedef struct {
+    gemm_ctx c[3];
+    size_t   first_blk[4];
+    int      n;
+} multi_gemm;
+
+static void multi_gemm_block(void *ctx_, size_t b) {
+    multi_gemm *m = ctx_;
+    int i = 0;
+    while (b >= m->first_blk[i + 1]) i++;
+    gemm_row_block(&m->c[i], b - m->first_blk[i]);
+}
+
+/* For each matrix i and token t < T:
+ *   out[i][t * out_stride[i] + r] = BitLinear(W[i], xq[t]) with scale gamma[t].
  * All row blocks of all matrices go into one pool job so small projections
- * (k, v) do not each pay a fork/join. */
-static void bitlinear_multi(threadpool *pool, const int8_t *xq, float gamma, int K,
-                            const bitnet_tensor *const *W, float *const *out, int n, int32_t *yi) {
-    multi_gemv m;
-    m.n = n;
-    m.first_blk[0] = 0;
+ * (k, v) do not each pay a fork/join. One token uses the GEMV kernels; more
+ * use the batched GEMM, which decodes each weight block once for GEMM_TB
+ * tokens. Both produce identical int32 sums. */
+static void bitlinear_batch(RunState *s, int T, const float *gamma, int K,
+                            const bitnet_tensor *const *W, float *const *out,
+                            const size_t *out_stride, int n) {
     size_t off = 0;
-    for (int i = 0; i < n; i++) {
-        const ternary_layout L = W[i]->dtype == BITNET_DTYPE_TERNARY_I128 ? TERNARY_I128 : TERNARY_ROW4;
-        m.c[i] = (gemv_ctx){xq, (const uint8_t *)W[i]->data, yi + off, W[i]->rows, K,
-                            ternary_row_bytes(K, L), L};
-        m.first_blk[i + 1] = m.first_blk[i] + ((size_t)W[i]->rows + GEMV_ROW_BLOCK - 1) / GEMV_ROW_BLOCK;
-        off += (size_t)W[i]->rows;
+    if (T == 1) {
+        multi_gemv m;
+        m.n = n;
+        m.first_blk[0] = 0;
+        for (int i = 0; i < n; i++) {
+            const ternary_layout L = W[i]->dtype == BITNET_DTYPE_TERNARY_I128 ? TERNARY_I128 : TERNARY_ROW4;
+            m.c[i] = (gemv_ctx){s->xq, (const uint8_t *)W[i]->data, s->yi + off, W[i]->rows, K,
+                                ternary_row_bytes(K, L), L};
+            m.first_blk[i + 1] = m.first_blk[i] + ((size_t)W[i]->rows + GEMV_ROW_BLOCK - 1) / GEMV_ROW_BLOCK;
+            off += (size_t)W[i]->rows;
+        }
+        threadpool_run(s->pool, m.first_blk[n], &m, multi_gemv_block);
+    } else {
+        multi_gemm m;
+        m.n = n;
+        m.first_blk[0] = 0;
+        for (int i = 0; i < n; i++) {
+            const ternary_layout L = W[i]->dtype == BITNET_DTYPE_TERNARY_I128 ? TERNARY_I128 : TERNARY_ROW4;
+            m.c[i] = (gemm_ctx){s->xq, s->xq_stride, s->yi + off, s->yi_stride, T,
+                                (const uint8_t *)W[i]->data, W[i]->rows, K, ternary_row_bytes(K, L), L};
+            m.first_blk[i + 1] = m.first_blk[i] + ((size_t)W[i]->rows + GEMV_ROW_BLOCK - 1) / GEMV_ROW_BLOCK;
+            off += (size_t)W[i]->rows;
+        }
+        threadpool_run(s->pool, m.first_blk[n], &m, multi_gemm_block);
     }
-    threadpool_run(pool, m.first_blk[n], &m, multi_gemv_block);
-    off = 0;
-    for (int i = 0; i < n; i++) {
-        dequantize_neon(yi + off, out[i], W[i]->rows, dequant_scale(gamma, W[i]->scale));
-        off += (size_t)W[i]->rows;
+    for (int t = 0; t < T; t++) {
+        off = 0;
+        for (int i = 0; i < n; i++) {
+            dequantize_neon(s->yi + (size_t)t * s->yi_stride + off, out[i] + (size_t)t * out_stride[i],
+                            W[i]->rows, dequant_scale(gamma[t], W[i]->scale));
+            off += (size_t)W[i]->rows;
+        }
     }
 }
 
@@ -596,14 +632,19 @@ int runstate_init(RunState *s, const BitNetModel *m, int max_seq_len, int n_thre
     const size_t cache = (size_t)c->n_layers * max_seq_len * kv_dim;
     const size_t rope = (size_t)max_seq_len * (hd / 2);
 
+    /* Activation buffers hold TRANSFORMER_BATCH rows (prefill); single-token
+     * passes use row 0. xq rows are padded to whole GEMM_TB groups. */
+    const size_t B = TRANSFORMER_BATCH, BQ = (TRANSFORMER_BATCH + GEMM_TB - 1) / GEMM_TB * GEMM_TB;
+    s->xq_stride = align64((size_t)xq_len);
+    s->yi_stride = (size_t)q_dim + 2 * kv_dim + 2 * (size_t)c->hidden_dim + c->dim;
     struct { void **p; size_t bytes; } parts[] = {
-        {(void **)&s->x, (size_t)c->dim * 4},          {(void **)&s->xb, (size_t)c->dim * 4},
-        {(void **)&s->xb2, (size_t)q_dim * 4},         {(void **)&s->q, (size_t)q_dim * 4},
+        {(void **)&s->x, B * c->dim * 4},              {(void **)&s->xb, B * c->dim * 4},
+        {(void **)&s->xb2, B * q_dim * 4},             {(void **)&s->q, B * q_dim * 4},
         {(void **)&s->attn_part, attention_scratch_floats(c->n_heads, hd, max_seq_len) * 4},
-        {(void **)&s->hb, (size_t)c->hidden_dim * 4},  {(void **)&s->hb2, (size_t)c->hidden_dim * 4},
+        {(void **)&s->hb, B * c->hidden_dim * 4},      {(void **)&s->hb2, B * c->hidden_dim * 4},
         {(void **)&s->logits, (size_t)c->vocab_size * 4},
-        {(void **)&s->xq, (size_t)xq_len},
-        {(void **)&s->yi, ((size_t)q_dim + 2 * kv_dim + 2 * (size_t)c->hidden_dim + c->dim) * 4},
+        {(void **)&s->xq, BQ * s->xq_stride},
+        {(void **)&s->yi, B * s->yi_stride * 4},
         {(void **)&s->key_cache, cache * 4},           {(void **)&s->value_cache, cache * 4},
         {(void **)&s->rope_cos, rope * 4},             {(void **)&s->rope_sin, rope * 4},
     };
@@ -671,84 +712,15 @@ void transformer_forward(int token_id, int pos, const BitNetModel *m, RunState *
 
 void transformer_forward_ex(int token_id, int pos, const BitNetModel *m, RunState *s,
                             int compute_logits) {
+    const int32_t tok = token_id;
+    transformer_forward_batch(&tok, 1, pos, m, s, compute_logits);
+}
+
+/* Final norm + output projection of residual row x into s->logits. */
+static void output_logits(const BitNetModel *m, RunState *s, const float *x) {
     const bitnet_config *c = &m->config;
-    if (token_id < 0 || token_id >= c->vocab_size || pos < 0 || pos >= s->max_seq_len) {
-        fprintf(stderr, "transformer_forward: token %d / pos %d out of range\n", token_id, pos);
-        abort();
-    }
-    const int dim = c->dim, hd = c->head_dim, hidden = c->hidden_dim;
-    const int q_dim = c->n_heads * hd, kv_dim = c->n_kv_heads * hd;
-    const float eps = c->norm_eps;
-    const int relu2 = c->ffn_act == BITNET_ACT_RELU2;
-    const float *rc = s->rope_cos + (size_t)pos * (hd / 2), *rs = s->rope_sin + (size_t)pos * (hd / 2);
-    const uint64_t t_start = s->profile ? now_ns() : 0;
-    uint64_t t_mark = t_start;
-
-    bitnet_embedding_row(m, token_id, s->x);
-    PROF_MARK(embed);
-
-    for (int l = 0; l < c->n_layers; l++) {
-        const bitnet_layer *L = &m->layers[l];
-        const size_t layer_off = (size_t)l * s->max_seq_len * kv_dim;
-        float *kc = s->key_cache + layer_off + (size_t)pos * kv_dim;
-        float *vc = s->value_cache + layer_off + (size_t)pos * kv_dim;
-
-        /* ---- Attention: QKV projections (K/V written straight into the cache). */
-        rmsnorm_neon(s->xb, s->x, L->attn_norm->data, dim, eps);
-        float gamma = quantize_act_neon(s->xb, s->xq, dim);
-        {
-            const bitnet_tensor *W[3] = {L->wq, L->wk, L->wv};
-            float *out[3] = {s->q, kc, vc};
-            bitlinear_multi(s->pool, s->xq, gamma, dim, W, out, 3, s->yi);
-        }
-        apply_rope_neon(s->q, c->n_heads, hd, rc, rs);
-        apply_rope_neon(kc, c->n_kv_heads, hd, rc, rs);
-        PROF_MARK(attn_proj);
-
-        /* ---- Scaled dot-product attention over positions 0..pos (GQA). */
-        attention_neon(s->xb2, s->q, s->key_cache + layer_off, s->value_cache + layer_off, pos,
-                       c->n_heads, c->n_kv_heads, hd, kv_dim, s->attn_part, s->pool);
-        PROF_MARK(attention);
-
-        if (L->attn_sub_norm) rmsnorm_neon(s->xb2, s->xb2, L->attn_sub_norm->data, q_dim, eps);
-        gamma = quantize_act_neon(s->xb2, s->xq, q_dim);
-        {
-            const bitnet_tensor *W[1] = {L->wo};
-            float *out[1] = {s->xb};
-            bitlinear_multi(s->pool, s->xq, gamma, q_dim, W, out, 1, s->yi);
-        }
-        residual_add_neon(s->x, s->xb, dim);
-        PROF_MARK(attn_proj);
-
-        /* ---- Feed-forward: down(sub_norm(act(gate(h)) * up(h))). */
-        rmsnorm_neon(s->xb, s->x, L->ffn_norm->data, dim, eps);
-        gamma = quantize_act_neon(s->xb, s->xq, dim);
-        {
-            const bitnet_tensor *W[2] = {L->w_gate, L->w_up};
-            float *out[2] = {s->hb, s->hb2};
-            bitlinear_multi(s->pool, s->xq, gamma, dim, W, out, 2, s->yi);
-        }
-        glu_neon(s->hb, s->hb2, hidden, relu2);
-        if (L->ffn_sub_norm) rmsnorm_neon(s->hb, s->hb, L->ffn_sub_norm->data, hidden, eps);
-        gamma = quantize_act_neon(s->hb, s->xq, hidden);
-        {
-            const bitnet_tensor *W[1] = {L->w_down};
-            float *out[1] = {s->xb};
-            bitlinear_multi(s->pool, s->xq, gamma, hidden, W, out, 1, s->yi);
-        }
-        residual_add_neon(s->x, s->xb, dim);
-        PROF_MARK(ffn);
-    }
-
-    /* ---- Final norm + tied output projection. */
-    if (!compute_logits) {
-        if (s->profile) {
-            s->prof.total += now_ns() - t_start;
-            s->prof.tokens++;
-        }
-        return;
-    }
-    rmsnorm_neon(s->x, s->x, m->output_norm->data, dim, eps);
+    const int dim = c->dim;
+    rmsnorm_neon(s->x, x, m->output_norm->data, dim, c->norm_eps);
     if (m->output->dtype == BITNET_DTYPE_Q8) {
         /* x -> int8 blocks (xq is free after the last layer; xb holds the scales). */
         q8_quantize(s->x, s->xq, s->xb, dim);
@@ -763,9 +735,123 @@ void transformer_forward_ex(int token_id, int pos, const BitNetModel *m, RunStat
         threadpool_run(s->pool, ((size_t)c->vocab_size + F16_ROW_BLOCK - 1) / F16_ROW_BLOCK, &fc,
                        f32_rows);
     }
-    PROF_MARK(logits);
+}
+
+/* Up to TRANSFORMER_BATCH tokens at consecutive positions pos..pos+n-1. */
+static void forward_chunk(const int32_t *tokens, int n, int pos, const BitNetModel *m, RunState *s,
+                          int compute_logits) {
+    const bitnet_config *c = &m->config;
+    const int dim = c->dim, hd = c->head_dim, hidden = c->hidden_dim;
+    const int q_dim = c->n_heads * hd, kv_dim = c->n_kv_heads * hd;
+    const float eps = c->norm_eps;
+    const int relu2 = c->ffn_act == BITNET_ACT_RELU2;
+    const size_t xs = s->xq_stride;
+    float gamma[TRANSFORMER_BATCH];
+    const uint64_t t_start = s->profile ? now_ns() : 0;
+    uint64_t t_mark = t_start;
+
+#define ROW(buf, t, width) ((buf) + (size_t)(t) * (width))
+    for (int t = 0; t < n; t++) bitnet_embedding_row(m, tokens[t], ROW(s->x, t, dim));
+    PROF_MARK(embed);
+
+    for (int l = 0; l < c->n_layers; l++) {
+        const bitnet_layer *L = &m->layers[l];
+        const size_t layer_off = (size_t)l * s->max_seq_len * kv_dim;
+        float *kc = s->key_cache + layer_off + (size_t)pos * kv_dim;
+        float *vc = s->value_cache + layer_off + (size_t)pos * kv_dim;
+
+        /* ---- Attention: QKV projections (K/V written straight into the cache). */
+        for (int t = 0; t < n; t++) {
+            rmsnorm_neon(ROW(s->xb, t, dim), ROW(s->x, t, dim), L->attn_norm->data, dim, eps);
+            gamma[t] = quantize_act_neon(ROW(s->xb, t, dim), ROW(s->xq, t, xs), dim);
+        }
+        {
+            const bitnet_tensor *W[3] = {L->wq, L->wk, L->wv};
+            float *out[3] = {s->q, kc, vc};
+            const size_t os[3] = {(size_t)q_dim, (size_t)kv_dim, (size_t)kv_dim};
+            bitlinear_batch(s, n, gamma, dim, W, out, os, 3);
+        }
+        for (int t = 0; t < n; t++) {
+            const size_t rp = (size_t)(pos + t) * (hd / 2);
+            apply_rope_neon(ROW(s->q, t, q_dim), c->n_heads, hd, s->rope_cos + rp, s->rope_sin + rp);
+            apply_rope_neon(ROW(kc, t, kv_dim), c->n_kv_heads, hd, s->rope_cos + rp, s->rope_sin + rp);
+        }
+        PROF_MARK(attn_proj);
+
+        /* ---- Causal attention for each token over positions 0..pos+t (GQA). */
+        for (int t = 0; t < n; t++)
+            attention_neon(ROW(s->xb2, t, q_dim), ROW(s->q, t, q_dim), s->key_cache + layer_off,
+                           s->value_cache + layer_off, pos + t, c->n_heads, c->n_kv_heads, hd, kv_dim,
+                           s->attn_part, s->pool);
+        PROF_MARK(attention);
+
+        for (int t = 0; t < n; t++) {
+            float *a = ROW(s->xb2, t, q_dim);
+            if (L->attn_sub_norm) rmsnorm_neon(a, a, L->attn_sub_norm->data, q_dim, eps);
+            gamma[t] = quantize_act_neon(a, ROW(s->xq, t, xs), q_dim);
+        }
+        {
+            const bitnet_tensor *W[1] = {L->wo};
+            float *out[1] = {s->xb};
+            const size_t os[1] = {(size_t)dim};
+            bitlinear_batch(s, n, gamma, q_dim, W, out, os, 1);
+        }
+        for (int t = 0; t < n; t++) residual_add_neon(ROW(s->x, t, dim), ROW(s->xb, t, dim), dim);
+        PROF_MARK(attn_proj);
+
+        /* ---- Feed-forward: down(sub_norm(act(gate(h)) * up(h))). */
+        for (int t = 0; t < n; t++) {
+            rmsnorm_neon(ROW(s->xb, t, dim), ROW(s->x, t, dim), L->ffn_norm->data, dim, eps);
+            gamma[t] = quantize_act_neon(ROW(s->xb, t, dim), ROW(s->xq, t, xs), dim);
+        }
+        {
+            const bitnet_tensor *W[2] = {L->w_gate, L->w_up};
+            float *out[2] = {s->hb, s->hb2};
+            const size_t os[2] = {(size_t)hidden, (size_t)hidden};
+            bitlinear_batch(s, n, gamma, dim, W, out, os, 2);
+        }
+        for (int t = 0; t < n; t++) {
+            float *h = ROW(s->hb, t, hidden);
+            glu_neon(h, ROW(s->hb2, t, hidden), hidden, relu2);
+            if (L->ffn_sub_norm) rmsnorm_neon(h, h, L->ffn_sub_norm->data, hidden, eps);
+            gamma[t] = quantize_act_neon(h, ROW(s->xq, t, xs), hidden);
+        }
+        {
+            const bitnet_tensor *W[1] = {L->w_down};
+            float *out[1] = {s->xb};
+            const size_t os[1] = {(size_t)dim};
+            bitlinear_batch(s, n, gamma, hidden, W, out, os, 1);
+        }
+        for (int t = 0; t < n; t++) residual_add_neon(ROW(s->x, t, dim), ROW(s->xb, t, dim), dim);
+        PROF_MARK(ffn);
+    }
+
+    /* ---- Final norm + tied output projection, for the last token only. */
+    if (compute_logits) {
+        output_logits(m, s, ROW(s->x, n - 1, dim));
+        PROF_MARK(logits);
+    }
+#undef ROW
     if (s->profile) {
         s->prof.total += now_ns() - t_start;
-        s->prof.tokens++;
+        s->prof.tokens += (uint64_t)n;
+    }
+}
+
+void transformer_forward_batch(const int32_t *tokens, int n, int pos, const BitNetModel *m,
+                               RunState *s, int compute_logits) {
+    const bitnet_config *c = &m->config;
+    if (n < 1 || pos < 0 || pos > s->max_seq_len - n) {
+        fprintf(stderr, "transformer_forward: %d tokens at pos %d out of range\n", n, pos);
+        abort();
+    }
+    for (int t = 0; t < n; t++)
+        if (tokens[t] < 0 || tokens[t] >= c->vocab_size) {
+            fprintf(stderr, "transformer_forward: token %d / pos %d out of range\n", tokens[t], pos + t);
+            abort();
+        }
+    for (int i = 0; i < n; i += TRANSFORMER_BATCH) {
+        const int k = n - i < TRANSFORMER_BATCH ? n - i : TRANSFORMER_BATCH;
+        forward_chunk(tokens + i, k, pos + i, m, s, compute_logits && i + k == n);
     }
 }

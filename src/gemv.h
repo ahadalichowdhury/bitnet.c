@@ -326,4 +326,172 @@ static inline void gemv_bitnet_neon_st(const int8_t *act, const uint8_t *packed_
     gemv_neon_impl(act, packed_weight_matrix, out, M, K, 0);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Batched GEMM for prompt prefill: out[t][m] = dot(W row m, act[t])         */
+/*                                                                           */
+/* Each 128-weight I128 block is decoded once and multiplied against          */
+/* GEMM_TB tokens' activations, instead of once per token. All sums are      */
+/* exact int32, so every token's result equals the GEMV result bit-for-bit.  */
+/* ------------------------------------------------------------------------- */
+
+#define GEMM_TB 8 /* tokens per register tile; activation buffers hold a multiple */
+
+/* out[t] += sum over full 128-blocks [0, full) of row w . act[t], t < GEMM_TB.
+ * On AVX2 the result is sum((w+1) * a); the caller subtracts sum(a) per token
+ * (gemm_asum, shared by all rows). */
+#if defined(BITNET_NEON)
+static inline void ternary_gemm_i128(const int8_t *act, size_t as, const uint8_t *w, int full,
+                                     int32_t out[GEMM_TB]) {
+    const int8x16_t lut = vld1q_s8(k_ternary_lut);
+    const uint8x16_t m3 = vdupq_n_u8(3);
+    int32x4_t c[GEMM_TB];
+    for (int t = 0; t < GEMM_TB; t++) c[t] = vdupq_n_s32(0);
+    for (int b = 0; b < full; b += 128) {
+        const uint8x16_t p0 = vld1q_u8(w + (b >> 2)), p1 = vld1q_u8(w + (b >> 2) + 16);
+        const int8x16_t d0 = vqtbl1q_s8(lut, vandq_u8(p0, m3));
+        const int8x16_t d1 = vqtbl1q_s8(lut, vandq_u8(p1, m3));
+        const int8x16_t d2 = vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(p0, 2), m3));
+        const int8x16_t d3 = vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(p1, 2), m3));
+        const int8x16_t d4 = vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(p0, 4), m3));
+        const int8x16_t d5 = vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(p1, 4), m3));
+        const int8x16_t d6 = vqtbl1q_s8(lut, vshrq_n_u8(p0, 6));
+        const int8x16_t d7 = vqtbl1q_s8(lut, vshrq_n_u8(p1, 6));
+        for (int t = 0; t < GEMM_TB; t++) {
+            const int8_t *a = act + (size_t)t * as + b;
+            int32x4_t acc = c[t];
+            acc = TERNARY_DOT(acc, d0, vld1q_s8(a));
+            acc = TERNARY_DOT(acc, d1, vld1q_s8(a + 16));
+            acc = TERNARY_DOT(acc, d2, vld1q_s8(a + 32));
+            acc = TERNARY_DOT(acc, d3, vld1q_s8(a + 48));
+            acc = TERNARY_DOT(acc, d4, vld1q_s8(a + 64));
+            acc = TERNARY_DOT(acc, d5, vld1q_s8(a + 80));
+            acc = TERNARY_DOT(acc, d6, vld1q_s8(a + 96));
+            acc = TERNARY_DOT(acc, d7, vld1q_s8(a + 112));
+            c[t] = acc;
+        }
+    }
+    for (int t = 0; t < GEMM_TB; t++) out[t] += vaddvq_s32(c[t]);
+}
+
+static inline void gemm_asum(const int8_t *act, size_t as, int full, int32_t corr[GEMM_TB]) {
+    (void)act; (void)as; (void)full;
+    for (int t = 0; t < GEMM_TB; t++) corr[t] = 0;
+}
+#elif defined(BITNET_AVX2)
+static inline void ternary_gemm_i128(const int8_t *act, size_t as, const uint8_t *w, int full,
+                                     int32_t out[GEMM_TB]) {
+    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3), ones16 = _mm256_set1_epi16(1);
+    __m256i c[GEMM_TB];
+    for (int t = 0; t < GEMM_TB; t++) c[t] = _mm256_setzero_si256();
+    for (int b = 0; b < full; b += 128) {
+        const __m256i p = _mm256_loadu_si256((const __m256i *)(w + (b >> 2)));
+        const __m256i u0 = _mm256_shuffle_epi8(lut, _mm256_and_si256(p, m3));
+        const __m256i u1 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 2), m3));
+        const __m256i u2 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 4), m3));
+        const __m256i u3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 6), m3));
+        for (int t = 0; t < GEMM_TB; t++) {
+            const int8_t *a = act + (size_t)t * as + b;
+            /* 4 MADDUBS lanes in [-512, 508] each: the int16 sum cannot overflow. */
+            __m256i s = _mm256_maddubs_epi16(u0, _mm256_loadu_si256((const __m256i *)a));
+            s = _mm256_add_epi16(s, _mm256_maddubs_epi16(u1, _mm256_loadu_si256((const __m256i *)(a + 32))));
+            s = _mm256_add_epi16(s, _mm256_maddubs_epi16(u2, _mm256_loadu_si256((const __m256i *)(a + 64))));
+            s = _mm256_add_epi16(s, _mm256_maddubs_epi16(u3, _mm256_loadu_si256((const __m256i *)(a + 96))));
+            c[t] = _mm256_add_epi32(c[t], _mm256_madd_epi16(s, ones16));
+        }
+    }
+    for (int t = 0; t < GEMM_TB; t++) out[t] += hsum_epi32_avx2(c[t]);
+}
+
+/* corr[t] = sum(act[t][0, full)): subtracted once per row (w = (w+1) - 1). */
+static inline void gemm_asum(const int8_t *act, size_t as, int full, int32_t corr[GEMM_TB]) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    for (int t = 0; t < GEMM_TB; t++) {
+        __m256i s = _mm256_setzero_si256();
+        for (int b = 0; b < full; b += 128)
+            s = _mm256_add_epi32(s, _mm256_madd_epi16(i128_block_asum16(act + (size_t)t * as + b), ones16));
+        corr[t] = hsum_epi32_avx2(s);
+    }
+}
+#else
+static inline void ternary_gemm_i128(const int8_t *act, size_t as, const uint8_t *w, int full,
+                                     int32_t out[GEMM_TB]) {
+    for (int t = 0; t < GEMM_TB; t++)
+        out[t] += ternary_dot_i128_scalar_range(act + (size_t)t * as, w, 0, full);
+}
+
+static inline void gemm_asum(const int8_t *act, size_t as, int full, int32_t corr[GEMM_TB]) {
+    (void)act; (void)as; (void)full;
+    for (int t = 0; t < GEMM_TB; t++) corr[t] = 0;
+}
+#endif
+
+typedef struct {
+    const int8_t  *act;        /* [T rounded up to GEMM_TB][act_stride]; rows >= T are ignored */
+    size_t         act_stride;
+    int32_t       *out;        /* out[t * out_stride + m] */
+    size_t         out_stride;
+    int            T;
+    const uint8_t *W;
+    int            M, K;
+    size_t         stride;     /* weight row bytes */
+    ternary_layout layout;
+} gemm_ctx;
+
+#define GEMM_MAX_T 32 /* tokens per gemm call */
+
+/* Rows [blk * GEMV_ROW_BLOCK, +GEMV_ROW_BLOCK) for all T tokens. */
+static inline void gemm_row_block(void *ctx_, size_t blk) {
+    const gemm_ctx *c = (const gemm_ctx *)ctx_;
+    const int r0 = (int)blk * GEMV_ROW_BLOCK;
+    const int r1 = (r0 + GEMV_ROW_BLOCK < c->M) ? r0 + GEMV_ROW_BLOCK : c->M;
+    const int T = c->T, ngroups = (T + GEMM_TB - 1) / GEMM_TB;
+    int32_t acc[GEMV_ROW_BLOCK][GEMM_MAX_T];
+    memset(acc, 0, sizeof(acc));
+
+    for (int k0 = 0; k0 < c->K; k0 += GEMV_K_TILE) {
+        const int len = (c->K - k0 < GEMV_K_TILE) ? c->K - k0 : GEMV_K_TILE;
+        const uint8_t *wtile = c->W + (size_t)(k0 >> 2);
+        if (c->layout != TERNARY_I128) { /* ROW4 (v1 files): per-token 4-row kernel */
+            for (int t = 0; t < T; t++) {
+                const int8_t *a = c->act + (size_t)t * c->act_stride + k0;
+                int32_t tmp[GEMV_ROW_BLOCK] = {0};
+                int r = r0;
+                for (; r + 4 <= r1; r += 4)
+                    ternary_dot4_accumulate(a, wtile + (size_t)r * c->stride, c->stride, len, tmp + (r - r0));
+                for (; r < r1; r++) tmp[r - r0] += ternary_dot_neon(a, wtile + (size_t)r * c->stride, len);
+                for (r = r0; r < r1; r++) acc[r - r0][t] += tmp[r - r0];
+            }
+            continue;
+        }
+        const int full = len & ~127;
+        for (int g = 0; g < ngroups; g++) {
+            const int8_t *a = c->act + (size_t)g * GEMM_TB * c->act_stride + k0;
+            const int nt = T - g * GEMM_TB < GEMM_TB ? T - g * GEMM_TB : GEMM_TB;
+            int32_t corr[GEMM_TB];
+            gemm_asum(a, c->act_stride, full, corr);
+            for (int r = r0; r < r1; r++) {
+                const uint8_t *w = wtile + (size_t)r * c->stride;
+                int32_t s[GEMM_TB] = {0};
+                ternary_gemm_i128(a, c->act_stride, w, full, s);
+                for (int t = 0; t < nt; t++) {
+                    int32_t v = s[t] - corr[t];
+                    if (full < len) v += ternary_dot_i128_scalar_range(a + (size_t)t * c->act_stride, w, full, len);
+                    acc[r - r0][g * GEMM_TB + t] += v;
+                }
+            }
+        }
+    }
+    for (int r = r0; r < r1; r++)
+        for (int t = 0; t < T; t++) c->out[(size_t)t * c->out_stride + r] = acc[r - r0][t];
+}
+
+/* Single-threaded batched GEMM (the transformer runs gemm_row_block on its pool).
+ * act must hold ceil(T / GEMM_TB) * GEMM_TB readable rows; 1 <= T <= GEMM_MAX_T. */
+static inline void gemm_bitnet_layout(const int8_t *act, size_t act_stride, int T, const uint8_t *W,
+                                      int32_t *out, size_t out_stride, int M, int K,
+                                      ternary_layout layout) {
+    gemm_ctx ctx = {act, act_stride, out, out_stride, T, W, M, K, ternary_row_bytes(K, layout), layout};
+    for (size_t b = 0; b < ((size_t)M + GEMV_ROW_BLOCK - 1) / GEMV_ROW_BLOCK; b++) gemm_row_block(&ctx, b);
+}
+
 #endif /* BITNET_GEMV_H */
