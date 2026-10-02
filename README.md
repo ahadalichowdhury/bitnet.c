@@ -63,6 +63,24 @@ on 3,108 test cases, and clean AddressSanitizer / UndefinedBehaviorSanitizer /
 ThreadSanitizer / `leaks` runs. The int8 output layer costs +0.13% perplexity
 versus float16 (mean KL divergence 0.004 over 600 tokens).
 
+### vs Microsoft bitnet.cpp
+
+`./tools/bench_compare.sh` builds Microsoft's
+[bitnet.cpp](https://github.com/microsoft/BitNet) on the same machine, downloads
+its official `ggml-model-i2_s.gguf`, and runs both engines with `llama-bench`'s
+definitions (`pp512`: 512 prompt tokens as one batch; `tg128`: 128 tokens
+decoded one at a time; random tokens, warm-up excluded, 5 repetitions):
+
+| Apple M1, 4 threads | bitnet.c | bitnet.cpp (`01eb415`, i2_s) | |
+|---|---|---|---|
+| pp512 (tokens/s) | 132.5 ± 3.9 | 121.8 ± 1.8 | **1.09x** |
+| tg128 (tokens/s) | 40.0 ± 0.5 | 24.0 ± 0.3 | **1.67x** |
+| model file | 851 MiB | 1133 MiB | |
+
+4 threads is bitnet.cpp's best setting on the M1 (8 threads: 91 / 19 t/s).
+Run the script on your own machine for its numbers; `--help` documents the
+methodology and why bitnet.cpp is pinned to a March 2026 commit.
+
 ## Architecture
 
 bitnet.c is written in **pure C11** with no dependencies beyond libc and

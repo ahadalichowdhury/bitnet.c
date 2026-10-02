@@ -57,7 +57,7 @@ endif
 
 TESTS := $(BUILD)/test_dot_product $(BUILD)/test_gemv $(BUILD)/test_bitlinear \
          $(BUILD)/test_loader $(BUILD)/test_tokenizer $(BUILD)/test_transformer \
-         $(BUILD)/test_generate $(BUILD)/test_api
+         $(BUILD)/test_generate $(BUILD)/test_api $(BUILD)/bench_llama
 
 .PHONY: all lib tests test test-mock bench asan leaks clean
 
@@ -114,6 +114,8 @@ $(BUILD)/test_tokenizer: $(OBJ)/test_tokenizer.o $(OBJ)/tokenizer.o $(OBJ)/threa
 	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
 $(BUILD)/test_transformer: $(OBJ)/test_transformer.o $(OBJ)/transformer.o $(OBJ)/threadpool.o \
                             $(OBJ)/model_loader.o $(OBJ)/tokenizer.o
+	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+$(BUILD)/bench_llama: $(OBJ)/bench_llama.o $(OBJ)/transformer.o $(OBJ)/threadpool.o $(OBJ)/model_loader.o
 	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
 $(BUILD)/test_generate: $(OBJ)/test_generate.o $(OBJ)/generate.o $(OBJ)/transformer.o \
                          $(OBJ)/threadpool.o $(OBJ)/model_loader.o $(OBJ)/tokenizer.o
