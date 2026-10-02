@@ -19,6 +19,8 @@
  *               blocks of 32 bytes; byte j of a block holds weights j, 32+j,
  *               64+j, 96+j at bits 0, 2, 4, 6, so one shift + mask yields 32
  *               consecutive weights (ternary_dot.h). Written by default.
+ *   Q8          (v2 only; embeddings / lm_head) rows x cols int8 followed by
+ *               rows x cols/32 float32 block scales; cols % 32 == 0 (q8.h).
  *
  * The loader validates everything before exposing a pointer: magic, version,
  * CRCs of header and table, config sanity, every tensor's bounds, alignment,
@@ -57,6 +59,7 @@ typedef enum {
     BITNET_DTYPE_F16     = 1,
     BITNET_DTYPE_TERNARY = 2,      /* ROW4 layout (v1 and v2 files) */
     BITNET_DTYPE_TERNARY_I128 = 3, /* SIMD-friendly I128 layout, ternary_dot.h (v2 only) */
+    BITNET_DTYPE_Q8      = 4,      /* int8 + f32 scale per 32-block, q8.h (v2 only) */
 } bitnet_dtype;
 
 typedef enum {
@@ -151,7 +154,7 @@ typedef struct {
 
 typedef struct {
     bitnet_config        config;
-    const bitnet_tensor *tok_embeddings; /* F16 or F32 [vocab, dim] */
+    const bitnet_tensor *tok_embeddings; /* F16, F32 or Q8 [vocab, dim] */
     const bitnet_tensor *output_norm;    /* F32 [dim] */
     const bitnet_tensor *output;         /* == tok_embeddings when tied */
     bitnet_layer        *layers;         /* [n_layers] */

@@ -147,9 +147,12 @@ test-mock: tests | $(BUILD)
 	$(BUILD)/test_loader $(MOCK)/mock.bitnet --ref $(MOCK)/mock.ref --corrupt-tests --tmpdir $(MOCK) | grep -E "PASSED"
 	python3 tools/export_bitnet.py --mock --layout row4 --output $(MOCK)/mock_v1.bitnet --ref $(MOCK)/mock_v1.ref 2>/dev/null
 	$(BUILD)/test_loader $(MOCK)/mock_v1.bitnet --ref $(MOCK)/mock_v1.ref | grep -E "Reference check" | sed 's/^/[v1 file] /'
+	python3 tools/export_bitnet.py --mock --embed-dtype f16 --output $(MOCK)/mock_f16.bitnet --ref $(MOCK)/mock_f16.ref --max-seq-len 256 2>/dev/null
+	$(BUILD)/test_loader $(MOCK)/mock_f16.bitnet --ref $(MOCK)/mock_f16.ref | grep -E "Reference check" | sed 's/^/[f16 embeddings] /'
 	$(BUILD)/test_generate --unit-only | grep -E "PASSED"
 	@if [ -f $(TOKENIZER) ]; then $(BUILD)/test_tokenizer $(TOKENIZER) $(GOLDEN) --tmpdir $(MOCK) | grep -E "PASSED" && \
-	  $(BUILD)/test_transformer $(MOCK)/mock.bitnet $(TOKENIZER) $(MOCK)/mock.ref_logits | grep -E "PASSED|->"; \
+	  $(BUILD)/test_transformer $(MOCK)/mock.bitnet $(TOKENIZER) $(MOCK)/mock.ref_logits | grep -E "PASSED|->" && \
+	  $(BUILD)/test_transformer $(MOCK)/mock_f16.bitnet $(TOKENIZER) $(MOCK)/mock.ref_logits --no-unit-tests | grep -E -- "->" | sed 's/^/[f16 embeddings] /'; \
 	  else echo "(tokenizer.json not found: tokenizer/transformer suites skipped)"; fi
 	@echo "== mock tests passed"
 

@@ -287,7 +287,8 @@ int main(int argc, char **argv) {
     /* ---- memory info */
     BitNetMemoryInfo mi;
     assert(bitnet_memory_info(ctx, &mi) == 0);
-    assert(mi.model_mapped_bytes > (size_t)1 << 30 && mi.kv_cache_bytes == (size_t)2 * 30 * 4096 * 640 * 4);
+    assert(mi.model_mapped_bytes > (size_t)800 << 20 && /* q8: 851 MiB, f16: 1125 MiB */
+           mi.kv_cache_bytes == (size_t)2 * 30 * 4096 * 640 * 4);
     assert(mi.runstate_bytes > mi.kv_cache_bytes && mi.process_resident_bytes > 0);
     checks += 2;
     bitnet_free(ctx);

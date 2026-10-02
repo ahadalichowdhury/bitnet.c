@@ -21,6 +21,7 @@
 
 #include "platform.h"
 #include "simd.h"
+#include "q8.h"
 #if defined(__ARM_FEATURE_CRC32)
 #include <arm_acle.h>
 #endif
@@ -87,6 +88,7 @@ static const char *dtype_name(uint32_t dt) {
     case BITNET_DTYPE_F16:     return "f16";
     case BITNET_DTYPE_TERNARY: return "ternary";
     case BITNET_DTYPE_TERNARY_I128: return "ternary-i128";
+    case BITNET_DTYPE_Q8:      return "q8";
     }
     return "invalid";
 }
@@ -99,6 +101,7 @@ static uint64_t expected_nbytes(uint32_t dtype, uint32_t rows, uint32_t cols) {
     case BITNET_DTYPE_F16:     return r * c * 2u;
     case BITNET_DTYPE_TERNARY: return r * ((c + 3u) / 4u);
     case BITNET_DTYPE_TERNARY_I128: return r * (((c + 127u) / 128u) * 32u);
+    case BITNET_DTYPE_Q8:      return r * c + r * (c / 32u) * 4u;
     }
     return 0;
 }
@@ -182,7 +185,7 @@ static int validate_tensor(const bitnet_file_tensor *e, int idx, const bitnet_fi
                            char *err, size_t err_len) {
     if (!memchr(e->name, '\0', BITNET_NAME_LEN) || e->name[0] == '\0')
         return fail(err, err_len, "tensor %d: name is empty or not NUL-terminated", idx);
-    if (e->dtype > BITNET_DTYPE_TERNARY_I128 || (e->dtype == BITNET_DTYPE_TERNARY_I128 && h->version < 2))
+    if (e->dtype > BITNET_DTYPE_Q8 || (e->dtype >= BITNET_DTYPE_TERNARY_I128 && h->version < 2))
         return fail(err, err_len, "%s: invalid dtype %u", e->name, e->dtype);
     if (e->ndim < 1 || e->ndim > 2 || e->rows == 0 || e->cols == 0 ||
         (e->ndim == 1 && e->cols != 1) || e->rows > (uint32_t)INT32_MAX ||
@@ -191,6 +194,8 @@ static int validate_tensor(const bitnet_file_tensor *e, int idx, const bitnet_fi
                     e->name, e->ndim, e->rows, e->cols);
     if ((e->dtype == BITNET_DTYPE_TERNARY || e->dtype == BITNET_DTYPE_TERNARY_I128) && e->ndim != 2)
         return fail(err, err_len, "%s: ternary tensors must be 2-D", e->name);
+    if (e->dtype == BITNET_DTYPE_Q8 && (e->ndim != 2 || e->cols % 32 != 0))
+        return fail(err, err_len, "%s: q8 tensors must be 2-D with cols %% 32 == 0", e->name);
     if (e->offset % BITNET_ALIGN != 0)
         return fail(err, err_len, "%s: offset %llu not %u-byte aligned",
                     e->name, (unsigned long long)e->offset, BITNET_ALIGN);
@@ -236,7 +241,7 @@ static int bind_model(bitnet_model *m, char *err, size_t err_len) {
     const bitnet_config *c = &m->config;
     const int d = c->dim, hd = c->hidden_dim;
     const int q_out = c->n_heads * c->head_dim, kv_out = c->n_kv_heads * c->head_dim;
-    const unsigned F = DT(BITNET_DTYPE_F32), E = DT(BITNET_DTYPE_F32) | DT(BITNET_DTYPE_F16),
+    const unsigned F = DT(BITNET_DTYPE_F32), E = DT(BITNET_DTYPE_F32) | DT(BITNET_DTYPE_F16) | DT(BITNET_DTYPE_Q8),
                    T = DT(BITNET_DTYPE_TERNARY) | DT(BITNET_DTYPE_TERNARY_I128);
     const int sub = (c->flags & BITNET_FLAG_SUB_NORMS) != 0;
     int bound = 0;
@@ -412,6 +417,10 @@ void bitnet_embedding_row(const bitnet_model *model, int token, float *out) {
     const int dim = t->cols;
     if (t->dtype == BITNET_DTYPE_F32) {
         memcpy(out, (const float *)t->data + (size_t)token * dim, (size_t)dim * sizeof(float));
+        return;
+    }
+    if (t->dtype == BITNET_DTYPE_Q8) {
+        q8_dequant_row(t->data, t->rows, dim, token, out);
         return;
     }
     const uint16_t *src = (const uint16_t *)t->data + (size_t)token * dim;

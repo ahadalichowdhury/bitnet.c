@@ -10,7 +10,7 @@ A dependency-free C11 inference engine for **BitNet b1.58** ternary models
 (`{-1, 0, +1}` weights), hand-tuned for Apple Silicon with ARM NEON, with AVX2
 kernels for Intel/AMD x86-64. It runs
 [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
-at **~33 tokens/s on an M1**, with output matching an independent float64
+at **~40 tokens/s on an M1** in **~930 MB of RAM**, with output matching an independent float64
 reference of the Hugging Face implementation.
 
 ```
@@ -25,7 +25,7 @@ The capital of Japan is Tokyo.
 git clone https://github.com/ahadalichowdhury/bitnet.c.git && cd bitnet.c
 make
 
-# 2. Download the model (~1.2 GB, resumable) and convert it to .bitnet (needs numpy)
+# 2. Download the model (~1.2 GB, resumable) and convert it to an 851 MB .bitnet (needs numpy)
 ./tools/download_model.sh
 
 # 3. Run
@@ -48,18 +48,20 @@ Apple M1 (8 GB, 4 performance + 4 efficiency cores, 8 threads), `bitnet-b1.58-2B
 
 | Metric | Result |
 |---|---|
-| Decode throughput | **~33 tokens/s** (35 tok/s at short context, 30 tok/s at ~500 tokens) |
+| Decode throughput | **~40 tokens/s** (40 tok/s at short context, 36 tok/s at ~500 tokens) |
 | Model load (mmap + validation) | **0.27 ms**, zero-copy (+0.03 MiB resident until weights are touched) |
 | Time to first token | ~0.4 s for a short chat prompt (warm) |
 | Prompt prefill | ~53 tokens/s |
+| Model file | **851 MB** (ternary weights + int8 embeddings; 1125 MB with `--embed-dtype f16`) |
 | Heap allocations per token | **0** (measured on all threads during forward passes and `generate()`) |
-| Peak memory | **~1.2 GB** resident (1.1 GB memory-mapped weights + KV cache in use) |
+| Peak memory | **~930 MB** resident (851 MB memory-mapped weights + KV cache in use) |
 | Binary size | 140 KB CLI, 123 KB shared library |
 
 Reproduce with `./bitnet --bench`. Correctness: identical top-1 predictions to a
 float64 reference at every tested position, bit-exact Hugging Face tokenization
 on 3,108 test cases, and clean AddressSanitizer / UndefinedBehaviorSanitizer /
-ThreadSanitizer / `leaks` runs.
+ThreadSanitizer / `leaks` runs. The int8 output layer costs +0.13% perplexity
+versus float16 (mean KL divergence 0.004 over 600 tokens).
 
 ## Architecture
 
@@ -87,6 +89,11 @@ pthreads: no BLAS, no C++, no Python at runtime.
   blocks (`I128`) so each shift + mask of a 32-byte load yields 32 consecutive
   weights, with no per-byte shuffles. Older v1 files still load;
   `./tools/download_model.sh` upgrades them automatically.
+- **int8 output layer.** The tied embedding / output matrix (128256 x 2560, the
+  largest tensor) is stored as int8 in blocks of 32 with a float scale each
+  (`Q8`, `src/q8.h`): 1.125 bytes per weight instead of 2. The logits are exact
+  int32 block dot products (`SDOT` / `MADDUBS`) rescaled in a fixed order, so
+  every SIMD path is bit-identical to the scalar reference.
 - **BitLinear.** Activations are quantized per token to int8 (absmax,
   round-half-to-even, matching PyTorch) and the int32 result is rescaled once
   (`src/bitlinear.h`).
@@ -161,6 +168,7 @@ make bench              # ./bitnet --bench
 |---|---|
 | `include/bitnet.h` | public C API |
 | `src/ternary_dot.h`, `src/gemv.h` | NEON / AVX2 ternary dot product and multi-row GEMV |
+| `src/q8.h` | int8 block-quantized output layer / embeddings |
 | `src/bitlinear.h` | int8 activation quantization / dequantization |
 | `src/model_loader.[ch]` | zero-copy mmap loader for the validated `.bitnet` format |
 | `src/tokenizer.[ch]`, `src/unicode_tables.h` | Llama-3 byte-level BPE (Unicode 16 tables) |

@@ -31,6 +31,7 @@
 
 #undef NDEBUG /* verification asserts must always run */
 #include <assert.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,7 @@
 
 #include "platform.h"
 #include "gemv.h"
+#include "q8.h"
 
 /* ------------------------------------------------------------------------- */
 /* Test utilities                                                            */
@@ -380,6 +382,126 @@ static void run_i128_verification(void) {
            "tails, -128 activations, reserved codes)\n", cases);
 }
 
+static float rand_unit(void) { return (float)(xorshift64() >> 40) / (float)(1u << 24); }
+
+/* Q8 output-layer kernels (q8.h): quantizer properties, and SIMD == scalar
+ * bit-for-bit (same int32 block sums, same 8-lane float order). */
+static void run_q8_verification(void) {
+    enum { MAXB = 160, MAXK = MAXB * Q8_BLOCK };
+    float  *x = aligned_buf(MAXK * sizeof(float)), *xs = aligned_buf(MAXB * sizeof(float));
+    float  *ws = aligned_buf(MAXB * sizeof(float)), *deq = aligned_buf(MAXK * sizeof(float));
+    int8_t *xq = aligned_buf(MAXK), *w = aligned_buf(MAXK);
+    int cases = 0;
+
+    /* Quantizer: |q| <= 127, block max hits 127, error <= half a step, zeros stay zero. */
+    for (int t = 0; t < 200; t++) {
+        const int n = Q8_BLOCK * (1 + t % 20);
+        const float mag = t % 3 == 0 ? 1e-3f : (t % 3 == 1 ? 1.0f : 300.0f);
+        for (int i = 0; i < n; i++) x[i] = (rand_unit() * 2.0f - 1.0f) * mag;
+        if (t % 4 == 0) memset(x + Q8_BLOCK * (t % (n / Q8_BLOCK)), 0, Q8_BLOCK * sizeof(float));
+        q8_quantize(x, xq, xs, n);
+        for (int b = 0; b < n / Q8_BLOCK; b++) {
+            int qmax = 0;
+            for (int j = 0; j < Q8_BLOCK; j++) {
+                const int i = b * Q8_BLOCK + j, q = xq[i];
+                assert(q >= -127 && q <= 127);
+                qmax = abs(q) > qmax ? abs(q) : qmax;
+                assert(fabsf((float)q * xs[b] - x[i]) <= 0.5f * xs[b] * (1.0f + 1e-5f) + 1e-30f);
+            }
+            assert(xs[b] == 0.0f ? qmax == 0 : qmax == 127);
+        }
+        cases++;
+    }
+    /* Ties round half to even: amax 127 gives step 1. */
+    for (int j = 0; j < Q8_BLOCK; j++) x[j] = 0.0f;
+    x[0] = 127.0f; x[1] = 0.5f; x[2] = 1.5f; x[3] = 2.5f; x[4] = -0.5f; x[5] = -2.5f;
+    q8_quantize(x, xq, xs, Q8_BLOCK);
+    assert(xs[0] == 1.0f && xq[0] == 127 && xq[1] == 0 && xq[2] == 2 && xq[3] == 2 &&
+           xq[4] == 0 && xq[5] == -2);
+    cases++;
+
+    /* Dot product: every block count 1..MAXB (8-block groups + tails). */
+    for (int nb = 1; nb <= MAXB; nb++) {
+        for (int t = 0; t < 4; t++) {
+            const int K = nb * Q8_BLOCK;
+            for (int i = 0; i < K; i++) {
+                w[i] = (int8_t)(uint8_t)xorshift64();               /* includes -128 */
+                xq[i] = (int8_t)((int)(xorshift64() % 255) - 127);  /* quantizer range */
+            }
+            if (t == 1) memset(w, -128, (size_t)K);                 /* extremes */
+            if (t == 1) memset(xq, 127, (size_t)K);
+            if (t == 2) memset(xq, -127, (size_t)K);
+            for (int b = 0; b < nb; b++) {
+                ws[b] = t == 3 && b % 5 == 0 ? 0.0f : rand_unit() * 0.05f;
+                xs[b] = rand_unit() * 0.1f;
+            }
+            const float s = q8_dot_scalar(w, ws, xq, xs, nb), v = q8_dot(w, ws, xq, xs, nb);
+            if (memcmp(&s, &v, sizeof(float)) != 0)
+                fprintf(stderr, "Q8 MISMATCH nb=%d t=%d: scalar %.9g simd %.9g\n", nb, t, s, v);
+            assert(memcmp(&s, &v, sizeof(float)) == 0);
+            double ref = 0.0;
+            for (int i = 0; i < K; i++)
+                ref += (double)w[i] * ws[i / Q8_BLOCK] * (double)xq[i] * xs[i / Q8_BLOCK];
+            double mag = 0.0;
+            for (int i = 0; i < K; i++)
+                mag += fabs((double)w[i] * ws[i / Q8_BLOCK] * (double)xq[i] * xs[i / Q8_BLOCK]);
+            assert(fabs((double)s - ref) <= 1e-5 * mag + 1e-30);
+            cases++;
+        }
+    }
+
+    /* Dequantized row == q * scale, from a packed [rows, K] tensor. */
+    {
+        enum { R = 3, K = 4 * Q8_BLOCK };
+        static int8_t buf[R * K + R * (K / Q8_BLOCK) * sizeof(float)];
+        for (int i = 0; i < R * K; i++) buf[i] = (int8_t)(uint8_t)xorshift64();
+        float sc[R * (K / Q8_BLOCK)];
+        for (int i = 0; i < R * (K / Q8_BLOCK); i++) sc[i] = rand_unit();
+        memcpy(buf + R * K, sc, sizeof(sc));
+        for (int r = 0; r < R; r++) {
+            q8_dequant_row(buf, R, K, r, deq);
+            for (int k = 0; k < K; k++)
+                assert(deq[k] == (float)buf[r * K + k] * sc[r * (K / Q8_BLOCK) + k / Q8_BLOCK]);
+        }
+        cases++;
+    }
+    free(x); free(xs); free(ws); free(deq); free(xq); free(w);
+    printf("Q8 kernels:     PASSED (%d cases: quantizer bounds/ties/zeros, %s dot == scalar "
+           "bit-exact for 1..%d blocks incl. -128, dequant rows)\n", cases, Q8_PATH, MAXB);
+}
+
+/* Q8 output-layer throughput, one thread (memory-bound shape: 128K x 2560 like
+ * the 2B model's lm_head would not fit the quick run, so 16K rows). */
+static void run_q8_benchmark(int quick) {
+    enum { M = 16384, K = 2560, NB = K / Q8_BLOCK };
+    int8_t *W = aligned_buf((size_t)M * K), *xq = aligned_buf(K);
+    float *ws = aligned_buf((size_t)M * NB * sizeof(float)), *xs = aligned_buf(NB * sizeof(float));
+    float *out = aligned_buf(M * sizeof(float));
+    for (size_t i = 0; i < (size_t)M * K; i++) W[i] = (int8_t)((int)(xorshift64() % 255) - 127);
+    for (int i = 0; i < K; i++) xq[i] = (int8_t)((int)(xorshift64() % 255) - 127);
+    for (size_t i = 0; i < (size_t)M * NB; i++) ws[i] = rand_unit();
+    for (int i = 0; i < NB; i++) xs[i] = rand_unit();
+    const int calls = quick ? 5 : 50;
+    double best[2] = {1e30, 1e30};
+    for (int v = 0; v < 2; v++)
+        for (int c = 0; c < calls; c++) {
+            const uint64_t t0 = now_ns();
+            for (int r = 0; r < M; r++)
+                out[r] = v ? q8_dot(W + (size_t)r * K, ws + (size_t)r * NB, xq, xs, NB)
+                           : q8_dot_scalar(W + (size_t)r * K, ws + (size_t)r * NB, xq, xs, NB);
+            __asm__ volatile("" : : "r"(out) : "memory");
+            const double ms = (double)(now_ns() - t0) / 1e6;
+            best[v] = ms < best[v] ? ms : best[v];
+        }
+    const double gb = ((double)M * K * 1.125) / 1e9;
+    printf("\nQ8 output layer: M=%d K=%d (%.1f MiB), 1 thread, best of %d\n", M, K,
+           (double)M * K * 1.125 / (1 << 20), calls);
+    printf("  scalar %8.3f ms  %6.2f GB/s\n", best[0], gb / (best[0] / 1e3));
+    printf("  %-6s %8.3f ms  %6.2f GB/s  (%.1fx)\n", "SIMD", best[1], gb / (best[1] / 1e3),
+           best[0] / best[1]);
+    free(W); free(xq); free(ws); free(xs); free(out);
+}
+
 /* ROW4 vs I128 GEMV throughput on the same logical weights. */
 static void run_layout_benchmark(int quick) {
     enum { M = 4096, K = 4096 };
@@ -420,7 +542,9 @@ int main(int argc, char **argv) {
     const int quick = argc > 1 && strcmp(argv[1], "--quick") == 0;
     run_verification();
     run_i128_verification();
+    run_q8_verification();
     run_benchmark(quick);
     run_layout_benchmark(quick);
+    run_q8_benchmark(quick);
     return 0;
 }

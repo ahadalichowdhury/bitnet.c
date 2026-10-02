@@ -683,7 +683,8 @@ static void model_tests(ctx_t *c, int quick) {
         printf("  -> stopped by stop string after %d tokens; '.' never streamed\n", st.n_generated);
     }
 
-    /* G. Repetition penalty breaks the greedy emoji loop seen above. */
+    /* G. Repetition penalty breaks a greedy repetition loop: a raw completion
+     *    of "one one one ..." repeats " one" under greedy decoding. */
     {
         int counts_max[2];
         for (int pen = 0; pen < 2; pen++) {
@@ -692,13 +693,11 @@ static void model_tests(ctx_t *c, int quick) {
             Sampler smp;
             char err[64];
             assert(sampler_init(&smp, c->m->config.vocab_size, &cfg, err, sizeof(err)) == 0);
-            n = build_chat_prompt(c->tk, DEFAULT_SYSTEM,
-                                  "Reply with five emoji that describe a happy summer day, then the word done.",
-                                  1, prompt, CAP);
+            n = encode_raw(c->tk, "one one one one one one one one one one one one", prompt, CAP);
             capture pc = {text2, 0, 65536, 1, 0, 0};
-            const GenerateParams gp = {.max_new_tokens = 48, .stop_tokens = c->stop, .n_stop = 2,
+            const GenerateParams gp = {.max_new_tokens = 32, .stop_tokens = c->stop, .n_stop = 2,
                                        .on_text = capture_sink, .user = &pc, .out_tokens = out2, .out_cap = 48};
-            printf("\n--- emoji, greedy, repetition penalty %.1f\nAssistant: ", cfg.repetition_penalty);
+            printf("\n--- raw \"one one one ...\", greedy, repetition penalty %.1f\n", cfg.repetition_penalty);
             GenerateStats st;
             assert(generate(c->m, c->tk, c->s, &smp, prompt, n, 0, &gp, &st) == 0);
             printf("\n");

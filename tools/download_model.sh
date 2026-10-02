@@ -79,6 +79,16 @@ ok "SHA-256 $WEIGHTS_SHA256"
 # ---- 2. convert -------------------------------------------------------------------
 step "Converting to ${OUT#$ROOT/}"
 # Format version (u32 at byte 4): v1 files are upgraded to the v2 SIMD layout.
+# dtype of tok_embeddings (0 f32, 1 f16, 4 q8): header table_offset at byte 64, 96-byte entries.
+embed_dtype() { python3 - "$1" <<'PY' 2>/dev/null || echo -1
+import struct, sys
+f = open(sys.argv[1], "rb"); h = f.read(256)
+n, esz = struct.unpack_from("<II", h, 56); (toff,) = struct.unpack_from("<Q", h, 64)
+f.seek(toff); t = f.read(n * esz)
+print(next(struct.unpack_from("<I", t, i * esz + 48)[0] for i in range(n)
+           if t[i * esz:i * esz + 48].split(b"\0")[0] == b"tok_embeddings"))
+PY
+}
 fmt_version() { python3 -c "import struct,sys; print(struct.unpack('<I', open(sys.argv[1],'rb').read(8)[4:8])[0])" "$1" 2>/dev/null || echo 0; }
 if [ -f "$OUT" ] && [ "$(fmt_version "$OUT")" -lt 2 ]; then
     printf '    %s!%s %s is format v1: re-converting to v2 (faster SIMD weight layout)\n' "$Y" "$N" "${OUT#$ROOT/}"
@@ -86,6 +96,10 @@ if [ -f "$OUT" ] && [ "$(fmt_version "$OUT")" -lt 2 ]; then
 fi
 if [ -f "$OUT" ] && [ -f "${OUT%.bitnet}.ref" ]; then
     ok "already converted (format v$(fmt_version "$OUT"))"
+    if [ "$(embed_dtype "$OUT")" = 1 ]; then
+        printf '    %stip:%s this file has float16 embeddings; int8 (q8, the default now) is ~25%% smaller\n' "$Y" "$N"
+        printf '         and faster: rm %s && %s\n' "${OUT#$ROOT/}" "./tools/download_model.sh"
+    fi
 else
     command -v python3 >/dev/null || die "python3 is required for the conversion"
     python3 -c "import numpy" 2>/dev/null || die "numpy is required: python3 -m pip install numpy"
