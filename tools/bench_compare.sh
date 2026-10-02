@@ -30,6 +30,8 @@
 # as type "Q1_0" and runs it ~40x slower, so it is not a fair baseline. On some
 # CPUs that version crashes (SIGBUS) in prompt processing with micro-batches of
 # 128+ tokens; the script then re-runs with -ub 64 and says so in the table.
+# On x86 it does not compile with clang 18 as published (a const-correctness
+# error in src/ggml-bitnet-mad.cpp); the script applies a one-word type fix.
 #
 # Options: --threads LIST (comma-separated, default "4,<all CPUs>")
 #          --pp N (512)  --tg N (128)  --reps N (5)
@@ -97,6 +99,11 @@ if [ ! -x "$BENCH" ]; then
     fi
     git -C "$SRC" checkout -q "$BITNET_CPP_REF" || die "unknown BITNET_CPP_REF $BITNET_CPP_REF"
     git -C "$SRC" submodule update -q --init --recursive --depth 1 || die "submodule checkout failed"
+    # Compile fix for that version's AVX2 path (x86 only): a const pointer
+    # assigned to a non-const one is an error in C++. Type-only; the same line
+    # in the next function already reads "const int8_t * y_col".
+    sed -i.orig 's/^\([[:space:]]*\)int8_t \* y_col = y + col \* by;/\1const int8_t * y_col = y + col * by;/' \
+        "$SRC/src/ggml-bitnet-mad.cpp" && rm -f "$SRC/src/ggml-bitnet-mad.cpp.orig"
 
     if [ -z "${CC:-}" ]; then
         for c in clang-21 clang-20 clang-19 clang-18 clang; do
