@@ -1,0 +1,131 @@
+/*
+ * generate.h — Sampling, UTF-8-safe streaming and the autoregressive loop.
+ *
+ * Sampler (HF transformers order: temperature -> top-k -> top-p -> draw):
+ *   temperature <= 0   greedy argmax (lowest id wins ties)
+ *   top_k > 0          keep the k most likely tokens
+ *   top_p < 1          keep the smallest prefix (by descending probability)
+ *                      whose cumulative probability reaches top_p
+ *   seed               xoshiro256** seeded via splitmix64: the same seed and
+ *                      logits always give the same tokens
+ *
+ * Utf8Stream buffers bytes of a partial UTF-8 character (a token may carry a
+ * fragment of an emoji) and only ever emits complete, valid sequences;
+ * malformed input becomes U+FFFD instead of garbage on the terminal.
+ *
+ * generate(): sequential prefill of the prompt into the KV cache (logits only
+ * for the last prompt token), then sample -> stream -> forward until a stop
+ * token, max_new_tokens or the end of the KV cache. No heap allocation after
+ * sampler_init.
+ */
+#ifndef BITNET_GENERATE_H
+#define BITNET_GENERATE_H
+
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "tokenizer.h"
+#include "transformer.h"
+
+/* ---- Sampler ------------------------------------------------------------- */
+
+typedef struct {
+    float    temperature; /* <= 0: greedy */
+    int      top_k;       /* <= 0 or >= vocab: disabled */
+    float    top_p;       /* >= 1: disabled */
+    uint64_t seed;
+} SamplerConfig;
+
+typedef struct {
+    SamplerConfig cfg;
+    int           vocab;
+    uint64_t      rng[4];  /* xoshiro256** state */
+    float        *probs;   /* [vocab] scratch */
+    int32_t      *idx;     /* [vocab] scratch */
+    void         *pairs;   /* [vocab] (prob, id) scratch for top-p sorting */
+} Sampler;
+
+int  sampler_init(Sampler *s, int vocab, const SamplerConfig *cfg, char *err, size_t err_len);
+void sampler_free(Sampler *s);
+void sampler_reseed(Sampler *s, uint64_t seed);
+
+/* Picks the next token from logits[vocab] (modified in place). */
+int32_t sampler_sample(Sampler *s, float *logits);
+
+/* Uniform double in [0, 1) from the sampler's RNG (exposed for tests). */
+double sampler_uniform(Sampler *s);
+
+/* ---- UTF-8 streaming ----------------------------------------------------- */
+
+typedef void (*text_sink)(void *user, const char *utf8, size_t len);
+
+typedef struct {
+    uint8_t   pending[4]; /* bytes of an incomplete character */
+    int       n_pending;
+    text_sink sink;
+    void     *user;
+} Utf8Stream;
+
+void utf8_stream_init(Utf8Stream *u, text_sink sink, void *user);
+/* Emits every complete character; holds back a trailing partial one. */
+void utf8_stream_write(Utf8Stream *u, const char *bytes, size_t len);
+/* End of text: a held-back partial character is emitted as U+FFFD. */
+void utf8_stream_flush(Utf8Stream *u);
+
+/* ---- Generation ---------------------------------------------------------- */
+
+typedef enum {
+    GEN_STOP_EOS,          /* sampled a stop token (not streamed, not fed) */
+    GEN_STOP_MAX_TOKENS,
+    GEN_STOP_CONTEXT_FULL,
+    GEN_STOP_CANCELLED,    /* *cancel became nonzero (e.g. Ctrl+C) */
+} gen_stop_reason;
+
+typedef struct {
+    int             max_new_tokens;
+    const int32_t  *stop_tokens;   /* e.g. <|eot_id|>, <|end_of_text|> */
+    int             n_stop;
+    text_sink       on_text;       /* NULL: no streaming */
+    void           *user;
+    int32_t        *out_tokens;    /* optional: generated ids (stop token excluded) */
+    int             out_cap;
+    const _Atomic int *cancel;     /* optional: checked before every forward pass; set it
+                                      from any thread or a signal handler (lock-free) */
+} GenerateParams;
+
+typedef struct {
+    int             n_prompt;
+    int             n_generated;   /* excludes the stop token */
+    int32_t         stop_token;    /* -1 unless reason == GEN_STOP_EOS */
+    int32_t         last_token;    /* last generated (non-stop) token, -1 if none;
+                                      it is NOT in the KV cache yet (end_pos is its slot) */
+    gen_stop_reason reason;
+    int             end_pos;       /* next free KV-cache position */
+    int             prefill_done;  /* 0 only if cancelled during the prompt */
+    double          prefill_ms;    /* prompt forward passes */
+    double          ttft_ms;       /* start -> first generated token streamed */
+    double          decode_ms;     /* first token -> end */
+    double          total_ms;
+    double          sample_ms;     /* time spent in sampler_sample (all tokens) */
+    double          prefill_tok_s; /* n_prompt / prefill_ms */
+    double          decode_tok_s;  /* (n_generated - 1) / decode_ms: one forward each */
+} GenerateStats;
+
+/* Runs prompt[0..n_prompt) at positions start_pos.. (continuing an existing
+ * KV cache when start_pos > 0) and generates. Returns 0, or -1 if the prompt
+ * does not fit in the KV cache or n_prompt < 1. */
+int generate(const BitNetModel *model, const Tokenizer *tok, RunState *state, Sampler *sampler,
+             const int32_t *prompt, int n_prompt, int start_pos, const GenerateParams *params,
+             GenerateStats *stats);
+
+/* Builds a BitNet-2B-4T chat prompt (tokenizer_config.json template):
+ *   [<|begin_of_text|> if with_bos] "System: {system}<|eot_id|>" (if system)
+ *   "User: {user}<|eot_id|>Assistant: "
+ * Contents are trimmed like the Jinja `| trim` filter and encoded with special
+ * tokens disabled, so "<|eot_id|>" typed by a user stays plain text. Returns
+ * the number of tokens (> max_tokens means truncated), or -1. */
+int build_chat_prompt(const Tokenizer *tok, const char *system, const char *user, int with_bos,
+                      int32_t *tokens, int max_tokens);
+
+#endif /* BITNET_GENERATE_H */
