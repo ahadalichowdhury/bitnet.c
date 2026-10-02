@@ -76,7 +76,10 @@ green before merging.
   file 1125 -> 851 MiB, M1 decode ~33 -> ~40 tok/s, perplexity +0.13%
 - [x] **P8: Benchmark vs Microsoft bitnet.cpp** — `tools/bench_compare.sh` +
   `build/bench_llama` (llama-bench's pp/tg definitions). M1, 4 threads:
-  pp512 1.09x, tg128 1.67x bitnet.cpp.
+  pp512 1.09x, tg128 1.67x bitnet.cpp; Xeon 8375C 4 vCPU: pp512 0.65x,
+  tg128 1.16x.
+- [ ] **P8b: x86 prefill** — beat bitnet.cpp's pp512 on x86 (VNNI
+  `VPDPBUSD`, int16 accumulation, larger token tiles in the AVX2 GEMM)
 
 ## C. Reach
 

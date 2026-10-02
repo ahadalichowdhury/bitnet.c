@@ -71,13 +71,17 @@ its official `ggml-model-i2_s.gguf`, and runs both engines with `llama-bench`'s
 definitions (`pp512`: 512 prompt tokens as one batch; `tg128`: 128 tokens
 decoded one at a time; random tokens, warm-up excluded, 5 repetitions):
 
-| Apple M1, 4 threads | bitnet.c | bitnet.cpp (`01eb415`, i2_s) | |
+| tokens/s, 4 threads | bitnet.c | bitnet.cpp (`01eb415`, i2_s) | bitnet.c / bitnet.cpp |
 |---|---|---|---|
-| pp512 (tokens/s) | 132.5 ± 3.9 | 121.8 ± 1.8 | **1.09x** |
-| tg128 (tokens/s) | 40.0 ± 0.5 | 24.0 ± 0.3 | **1.67x** |
+| Apple M1, pp512 | 132.5 ± 3.9 | 121.8 ± 1.8 | **1.09x** |
+| Apple M1, tg128 | 40.0 ± 0.5 | 24.0 ± 0.3 | **1.67x** |
+| Xeon Platinum 8375C (4 vCPU), pp512 | 41.5 ± 0.4 | 63.9 ± 0.8 | 0.65x |
+| Xeon Platinum 8375C (4 vCPU), tg128 | 19.0 ± 0.2 | 16.4 ± 0.8 | **1.16x** |
 | model file | 851 MiB | 1133 MiB | |
 
-4 threads is bitnet.cpp's best setting on the M1 (8 threads: 91 / 19 t/s).
+bitnet.c generates faster on both machines; on x86 bitnet.cpp's batched prompt
+kernel is ahead. 4 threads is bitnet.cpp's best setting on the M1 (8 threads:
+91 / 19 t/s).
 Run the script on your own machine for its numbers; `--help` documents the
 methodology and why bitnet.cpp is pinned to a March 2026 commit.
 
