@@ -74,8 +74,9 @@ green before merging.
   to token-by-token. Attention is still per token (batched attention open).
 - [x] **P7: int8 output layer** (v1.2.0) — Q8 blocks of 32 with f32 scales;
   file 1125 -> 851 MiB, M1 decode ~33 -> ~40 tok/s, perplexity +0.13%
-- [ ] **P8: Benchmark vs Microsoft bitnet.cpp** — same machine, same model,
-  documented methodology and script (`tools/bench_compare.sh`)
+- [x] **P8: Benchmark vs Microsoft bitnet.cpp** — `tools/bench_compare.sh` +
+  `build/bench_llama` (llama-bench's pp/tg definitions). M1, 4 threads:
+  pp512 1.09x, tg128 1.67x bitnet.cpp.
 
 ## C. Reach
 
