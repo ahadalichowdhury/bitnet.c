@@ -1,5 +1,8 @@
 # bitnet.c
 
+[![CI](https://github.com/ahadalichowdhury/bitnet.c/actions/workflows/ci.yml/badge.svg)](https://github.com/ahadalichowdhury/bitnet.c/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A dependency-free C11 inference engine for **BitNet b1.58** ternary models
 (`{-1, 0, +1}` weights), hand-tuned for Apple Silicon with ARM NEON. Runs
 [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
@@ -79,3 +82,9 @@ the model-free and mock-model suites on `ubuntu-latest`. `-DBITNET_FORCE_SCALAR`
 and `-DBITNET_PORTABLE` force those fallbacks on a Mac for testing.
 
 See `ROADMAP.md` for the 8 build steps.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). Model weights are not
+included: `microsoft/bitnet-b1.58-2B-4T` is distributed separately under its own
+license (see its Hugging Face model card).
