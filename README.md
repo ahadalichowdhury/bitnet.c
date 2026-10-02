@@ -75,13 +75,12 @@ decoded one at a time; random tokens, warm-up excluded, 5 repetitions):
 |---|---|---|---|
 | Apple M1, pp512 | 132.5 ± 3.9 | 121.8 ± 1.8 | **1.09x** |
 | Apple M1, tg128 | 40.0 ± 0.5 | 24.0 ± 0.3 | **1.67x** |
-| Xeon Platinum 8375C (4 vCPU), pp512 | 41.5 ± 0.4 | 63.9 ± 0.8 | 0.65x |
-| Xeon Platinum 8375C (4 vCPU), tg128 | 19.0 ± 0.2 | 16.4 ± 0.8 | **1.16x** |
+| Xeon Platinum 8375C (4 vCPU), pp512 | 77.6 ± 0.2 | 63.7 ± 0.8 | **1.22x** |
+| Xeon Platinum 8375C (4 vCPU), tg128 | 22.0 ± 1.0 | 16.1 ± 0.1 | **1.36x** |
 | model file | 851 MiB | 1133 MiB | |
 
-bitnet.c generates faster on both machines; on x86 bitnet.cpp's batched prompt
-kernel is ahead. 4 threads is bitnet.cpp's best setting on the M1 (8 threads:
-91 / 19 t/s).
+4 threads is bitnet.cpp's best setting on the M1 (8 threads: 91 / 19 t/s). On
+x86, bitnet.c uses VNNI (`VPDPBUSD`) where the CPU has it and AVX2 otherwise.
 Run the script on your own machine for its numbers; `--help` documents the
 methodology and why bitnet.cpp is pinned to a March 2026 commit.
 
@@ -102,6 +101,10 @@ pthreads: no BLAS, no C++, no Python at runtime.
   16-byte load is decoded into 64 weights with shifts, a mask and a single
   `TBL` lookup, then multiplied against int8 activations with the ARMv8.4
   `SDOT` instruction, four rows at a time (`src/ternary_dot.h`, `src/gemv.h`).
+- **x86 VNNI and attention.** On CPUs with AVX-VNNI / AVX512-VNNI (Ice Lake,
+  Sapphire Rapids, Alder Lake, Zen 4+) the integer kernels use `VPDPBUSD`;
+  attention has AVX2 + F16C kernels on the float16 cache, and a prefill chunk
+  runs all its tokens' attention in one thread-pool job.
 - **AVX2 kernels (x86-64).** The same ternary dot product and 4-row GEMV in
   256-bit form: one `PSHUFB` + two `AND`/`CMPEQ` masks decode 32 weights, and
   `MADDUBS`/`MADD` accumulate exactly (`maddubs(w+1, a) - maddubs(1, a)`, which
