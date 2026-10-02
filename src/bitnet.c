@@ -136,7 +136,8 @@ BitNetContext *bitnet_init(const char *model_path, const char *tokenizer_path, B
     /* Parameter count for the description (ternary + embeddings). */
     double params = (double)mc->vocab_size * mc->dim;
     for (int i = 0; i < c->model.n_tensors; i++)
-        if (c->model.tensors[i].dtype == BITNET_DTYPE_TERNARY)
+        if (c->model.tensors[i].dtype == BITNET_DTYPE_TERNARY ||
+            c->model.tensors[i].dtype == BITNET_DTYPE_TERNARY_I128)
             params += (double)c->model.tensors[i].rows * c->model.tensors[i].cols;
     snprintf(c->desc, sizeof(c->desc),
              "BitNet b1.58 %.1fB: %d layers, dim %d, hidden %d, %d/%d heads, vocab %d, context %d, "
