@@ -70,7 +70,7 @@ BitNetConfig bitnet_default_config(void) {
 }
 
 BitNetSampleParams bitnet_default_params(void) {
-    return (BitNetSampleParams){0.6f, 0, 0.9f, 0, 0};
+    return (BitNetSampleParams){.temperature = 0.6f, .top_p = 0.9f, .repetition_penalty = 1.0f};
 }
 
 /* ------------------------------------------------------------------------- */
@@ -119,7 +119,7 @@ BitNetContext *bitnet_init(const char *model_path, const char *tokenizer_path, B
         bitnet_free(c);
         return NULL;
     }
-    const SamplerConfig sc = {0.6f, 0, 0.9f, 1};
+    const SamplerConfig sc = {.temperature = 0.6f, .top_p = 0.9f, .seed = 1, .repetition_penalty = 1.0f};
     if (sampler_init(&c->sampler, c->model.config.vocab_size, &sc, err, sizeof(err)) != 0) {
         set_err(g_init_err, "sampler: %s", err);
         bitnet_free(c);
@@ -215,6 +215,10 @@ static void begin_call(BitNetContext *c, BitNetSampleParams p, bitnet_token_fn c
     sc.top_k = p.top_k > 0 ? p.top_k : 0;
     sc.top_p = (p.top_p > 0.0f && p.top_p < 1.0f) ? p.top_p : 1.0f;
     sc.seed = p.seed ? p.seed : fresh_seed(c);
+    sc.repetition_penalty = p.repetition_penalty > 0.0f ? p.repetition_penalty : 1.0f;
+    sc.frequency_penalty = p.frequency_penalty;
+    sc.presence_penalty = p.presence_penalty;
+    sc.penalty_last_n = p.penalty_last_n > SAMPLER_HISTORY ? SAMPLER_HISTORY : p.penalty_last_n;
     c->sampler.cfg = sc;
     sampler_reseed(&c->sampler, sc.seed);
     c->cb = cb;
@@ -232,6 +236,23 @@ static void fail_call(BitNetContext *c, const char *msg) {
     c->stats.context_used = c->chat_pos;
 }
 
+/* Checks params.stop; sets the error and returns -1 if invalid. */
+static int check_stops(BitNetContext *c, const BitNetSampleParams *p) {
+    if (p->n_stop <= 0) return 0;
+    if (p->n_stop > BITNET_MAX_STOP_STRINGS || !p->stop) {
+        fail_call(c, "too many stop strings (max 8)");
+        return -1;
+    }
+    for (int i = 0; i < p->n_stop; i++) {
+        const size_t l = p->stop[i] ? strlen(p->stop[i]) : 0;
+        if (l == 0 || l > STOP_MAX_LEN) {
+            fail_call(c, "stop strings must be 1..64 bytes");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int ensure_prompt_cap(BitNetContext *c, int need) {
     if (need <= c->prompt_cap) return 0;
     int32_t *p = realloc(c->prompt, (size_t)need * sizeof(int32_t));
@@ -247,14 +268,20 @@ static BitNetStopReason map_reason(gen_stop_reason r) {
     case GEN_STOP_MAX_TOKENS:   return BITNET_STOP_MAX_TOKENS;
     case GEN_STOP_CONTEXT_FULL: return BITNET_STOP_CONTEXT_FULL;
     case GEN_STOP_CANCELLED:    return BITNET_STOP_CANCELLED;
+    case GEN_STOP_STRING:       return BITNET_STOP_STOP_STRING;
     }
     return BITNET_STOP_ERROR;
 }
 
-static int run_generation(BitNetContext *c, int n_prompt, int start_pos, int max_new,
+static int run_generation(BitNetContext *c, int n_prompt, int start_pos, const BitNetSampleParams *p,
                           GenerateStats *st) {
-    const GenerateParams gp = {max_new > 0 ? max_new : INT_MAX, c->stop, 2,
-                               c->cb ? deliver : NULL, c, NULL, 0, &c->cancel};
+    const GenerateParams gp = {
+        .max_new_tokens = p->max_new_tokens > 0 ? p->max_new_tokens : INT_MAX,
+        .stop_tokens = c->stop, .n_stop = 2,
+        .on_text = c->cb ? deliver : NULL, .user = c,
+        .cancel = &c->cancel,
+        .stop_strings = p->n_stop > 0 ? p->stop : NULL, .n_stop_strings = p->n_stop > 0 ? p->n_stop : 0,
+    };
     if (generate(&c->model, c->tok, &c->rs, &c->sampler, c->prompt, n_prompt, start_pos, &gp, st) != 0)
         return -1;
     BitNetStats *o = &c->stats;
@@ -278,6 +305,7 @@ void bitnet_generate(BitNetContext *c, const char *prompt, BitNetSampleParams p,
     if (!c) return;
     begin_call(c, p, cb, ud);
     bitnet_reset_chat(c); /* the completion overwrites the KV cache from position 0 */
+    if (check_stops(c, &p) != 0) return;
     if (!prompt) {
         fail_call(c, "prompt is NULL");
         return;
@@ -296,7 +324,7 @@ void bitnet_generate(BitNetContext *c, const char *prompt, BitNetSampleParams p,
         return;
     }
     GenerateStats st;
-    if (run_generation(c, n, 0, p.max_new_tokens, &st) != 0) {
+    if (run_generation(c, n, 0, &p, &st) != 0) {
         fail_call(c, "generation failed");
         return;
     }
@@ -324,6 +352,7 @@ void bitnet_chat_turn(BitNetContext *c, const char *msg, BitNetSampleParams p, b
                       void *ud) {
     if (!c) return;
     begin_call(c, p, cb, ud);
+    if (check_stops(c, &p) != 0) return;
     if (!msg) {
         fail_call(c, "message is NULL");
         return;
@@ -346,7 +375,7 @@ void bitnet_chat_turn(BitNetContext *c, const char *msg, BitNetSampleParams p, b
     }
     const int start = continuing ? c->chat_pos : 0;
     GenerateStats st;
-    if (run_generation(c, n, start, p.max_new_tokens, &st) != 0) {
+    if (run_generation(c, n, start, &p, &st) != 0) {
         fail_call(c, "generation failed");
         return;
     }
@@ -354,7 +383,9 @@ void bitnet_chat_turn(BitNetContext *c, const char *msg, BitNetSampleParams p, b
         /* The turn is part of the conversation. A reply that ended without a
          * stop token leaves its last token outside the cache. */
         c->chat_pos = st.end_pos;
-        c->open_token = st.reason == GEN_STOP_EOS ? -1 : st.last_token;
+        /* A stop string ends the turn like a stop token: its completing
+         * token is dropped rather than fed. */
+        c->open_token = (st.reason == GEN_STOP_EOS || st.reason == GEN_STOP_STRING) ? -1 : st.last_token;
     } else if (c->stats.context_reset) {
         bitnet_reset_chat(c); /* the old history was already being overwritten */
     }

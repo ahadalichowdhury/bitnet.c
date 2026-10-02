@@ -29,7 +29,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MODEL = os.path.join(ROOT, "models", "bitnet_2b4t.bitnet")
 DEFAULT_TOKENIZER = os.path.join(ROOT, "models", "hf", "bitnet-b1.58-2B-4T", "tokenizer.json")
 
-STOP_REASONS = ["end_of_turn", "max_tokens", "context_full", "cancelled", "error"]
+STOP_REASONS = ["end_of_turn", "max_tokens", "context_full", "cancelled", "error", "stop_string"]
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +43,10 @@ class _Config(ctypes.Structure):
 
 class _Params(ctypes.Structure):
     _fields_ = [("temperature", ctypes.c_float), ("top_k", ctypes.c_int), ("top_p", ctypes.c_float),
-                ("seed", ctypes.c_uint64), ("max_new_tokens", ctypes.c_int)]
+                ("seed", ctypes.c_uint64), ("max_new_tokens", ctypes.c_int),
+                ("repetition_penalty", ctypes.c_float), ("frequency_penalty", ctypes.c_float),
+                ("presence_penalty", ctypes.c_float), ("penalty_last_n", ctypes.c_int),
+                ("stop", ctypes.POINTER(ctypes.c_char_p)), ("n_stop", ctypes.c_int)]
 
 
 class _Stats(ctypes.Structure):
@@ -138,15 +141,18 @@ class BitNet:
         self.close()
 
     # -- generation ---------------------------------------------------------
-    def generate(self, prompt, *, temperature=0.6, top_p=0.9, top_k=0, seed=0, max_new_tokens=256):
-        """Plain completion of `prompt`; yields text pieces as they are generated."""
-        return self._stream(self._lib.bitnet_generate, prompt, temperature, top_p, top_k, seed,
-                            max_new_tokens)
+    def generate(self, prompt, *, max_new_tokens=256, **sampling):
+        """Plain completion of `prompt`; yields text pieces as they are generated.
 
-    def chat_stream(self, message, *, temperature=0.6, top_p=0.9, top_k=0, seed=0, max_new_tokens=512):
-        """One chat turn (conversation history is kept); yields the reply as it streams."""
-        return self._stream(self._lib.bitnet_chat_turn, message, temperature, top_p, top_k, seed,
-                            max_new_tokens)
+        Sampling keywords: temperature=0.6, top_p=0.9, top_k=0, seed=0,
+        repetition_penalty=1.0, frequency_penalty=0.0, presence_penalty=0.0,
+        penalty_last_n=64, stop=None (list of up to 8 strings)."""
+        return self._stream(self._lib.bitnet_generate, prompt, max_new_tokens, **sampling)
+
+    def chat_stream(self, message, *, max_new_tokens=512, **sampling):
+        """One chat turn (conversation history is kept); yields the reply as it streams.
+        Accepts the same sampling keywords as generate()."""
+        return self._stream(self._lib.bitnet_chat_turn, message, max_new_tokens, **sampling)
 
     def chat(self, message, **kw):
         """One chat turn; returns the whole reply."""
@@ -170,10 +176,17 @@ class BitNet:
         out["context_reset"] = bool(s.context_reset)
         return out
 
-    def _stream(self, fn, text, temperature, top_p, top_k, seed, max_new_tokens):
+    def _stream(self, fn, text, max_new_tokens, temperature=0.6, top_p=0.9, top_k=0, seed=0,
+                repetition_penalty=1.0, frequency_penalty=0.0, presence_penalty=0.0,
+                penalty_last_n=64, stop=None):
         if not self._ctx:
             raise BitNetError("context is closed")
-        params = _Params(temperature, top_k, top_p, seed, max_new_tokens)
+        stops = [s.encode("utf-8") for s in (stop or [])]
+        stop_arr = (ctypes.c_char_p * len(stops))(*stops) if stops else None
+        params = _Params(temperature, top_k, top_p, seed, max_new_tokens, repetition_penalty,
+                         frequency_penalty, presence_penalty, penalty_last_n,
+                         ctypes.cast(stop_arr, ctypes.POINTER(ctypes.c_char_p)) if stops else None,
+                         len(stops))
         pieces = queue.Queue()
         done = object()
 
@@ -199,7 +212,7 @@ class BitNet:
             if worker.is_alive():
                 self.cancel()
             worker.join()
-            _ = on_token  # keep the callback alive until the C call has returned
+            _ = (on_token, stop_arr)  # keep callback + stop strings alive until C returns
         if self.stats["stop_reason"] == "error":
             raise BitNetError(self._lib.bitnet_last_error(self._ctx).decode(errors="replace"))
 
@@ -245,6 +258,9 @@ def _self_test():
         print(f"early stop:  cancelled after {s['generated_tokens']} tokens")
         emoji = "".join(llm.chat_stream("Reply with three fruit emoji.", temperature=0, max_new_tokens=12))
         print(f"utf-8:       {emoji}")
+        cut = "".join(llm.generate("The capital of France is", temperature=0, stop=["."]))
+        assert llm.stats["stop_reason"] == "stop_string" and "." not in cut, (cut, llm.stats)
+        print(f"stop string: 'The capital of France is{cut}' (stopped before '.')")
         print(f"stats:       TTFT {s['ttft_ms']:.0f} ms, decode {s['decode_tok_s']:.1f} tok/s")
     print("Python bindings: PASSED")
 
