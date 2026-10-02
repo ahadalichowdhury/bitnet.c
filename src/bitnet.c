@@ -410,7 +410,7 @@ int bitnet_memory_info(const BitNetContext *c, BitNetMemoryInfo *out) {
     out->model_mapped_bytes = c->model.map_size;
     out->runstate_bytes = c->rs.arena_bytes;
     out->kv_cache_bytes = 2 * (size_t)mc->n_layers * c->rs.max_seq_len * mc->n_kv_heads * mc->head_dim *
-                          sizeof(float);
+                          sizeof(uint16_t); /* float16 */
     out->process_resident_bytes = platform_resident_bytes();
     struct rusage ru;
 #ifdef __APPLE__

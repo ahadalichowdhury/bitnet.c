@@ -19,9 +19,15 @@
 #define BITNET_AVX2 1
 #include <immintrin.h>
 /* F16C (VCVTPH2PS) for the float16 output layer; BITNET_NO_F16C keeps the
- * scalar conversion so AVX2 and scalar builds can be compared bit-for-bit. */
+ * scalar GEMV (F16C reorders its float sum) so AVX2 and scalar builds can be
+ * compared bit-for-bit. */
 #if defined(__F16C__) && !defined(BITNET_NO_F16C)
 #define BITNET_F16C 1
+#endif
+/* F16C row conversions (float16 KV cache). These round exactly like the
+ * scalar float_to_half, so they stay on even with BITNET_NO_F16C. */
+#if defined(__F16C__)
+#define BITNET_F16C_CVT 1
 #endif
 #if defined(__FMA__)
 #define BITNET_FMADD(a, b, c) _mm256_fmadd_ps((a), (b), (c))

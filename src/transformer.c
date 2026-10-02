@@ -455,13 +455,51 @@ static void bitlinear_batch(RunState *s, int T, const float *gamma, int K,
 }
 
 /* ========================================================================= */
+/* float16 <-> float32 rows (KV cache)                                       */
+/* ========================================================================= */
+
+/* Hardware conversions use round-to-nearest-even (the default FPCR / MXCSR
+ * mode, and the immediate for VCVTPS2PH) with subnormals kept, which is
+ * exactly float_to_half; the scalar tails use float_to_half itself. */
+void f32_to_f16_row(uint16_t *out, const float *x, int n) {
+    int i = 0;
+#if defined(BITNET_NEON)
+    for (; i + 8 <= n; i += 8) {
+        const float16x8_t h = vcombine_f16(vcvt_f16_f32(vld1q_f32(x + i)), vcvt_f16_f32(vld1q_f32(x + i + 4)));
+        vst1q_u16(out + i, vreinterpretq_u16_f16(h));
+    }
+#elif defined(BITNET_F16C_CVT)
+    for (; i + 8 <= n; i += 8)
+        _mm_storeu_si128((__m128i *)(out + i),
+                         _mm256_cvtps_ph(_mm256_loadu_ps(x + i), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+#endif
+    for (; i < n; i++) out[i] = float_to_half(x[i]);
+}
+
+void f16_to_f32_row(float *out, const uint16_t *h, int n) {
+    int i = 0;
+#if defined(BITNET_NEON)
+    for (; i + 8 <= n; i += 8) {
+        const float16x8_t v = vreinterpretq_f16_u16(vld1q_u16(h + i));
+        vst1q_f32(out + i, vcvt_f32_f16(vget_low_f16(v)));
+        vst1q_f32(out + i + 4, vcvt_high_f32_f16(v));
+    }
+#elif defined(BITNET_F16C_CVT)
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(out + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(h + i))));
+#endif
+    for (; i < n; i++) out[i] = half_to_float(h[i]);
+}
+
+/* ========================================================================= */
 /* Attention (GQA-grouped, split-softmax over position chunks)               */
 /* ========================================================================= */
 
 typedef struct {
-    float       *out;
-    const float *q, *kc, *vc;
-    float       *part;
+    float          *out;
+    const float    *q;
+    const uint16_t *kc, *vc; /* float16 cache */
+    float          *part;
     int          pos, n_kv, group, hd, kv_dim, n_chunks;
     float        scale;
 } attn_job;
@@ -478,8 +516,9 @@ static void attn_item(void *ctx, size_t item) {
     const int kvh = (int)item / a->n_chunks, c = (int)item % a->n_chunks;
     const int t0 = c * ATTN_CHUNK, t1 = t0 + ATTN_CHUNK < a->pos + 1 ? t0 + ATTN_CHUNK : a->pos + 1;
     const int nt = t1 - t0, hd = a->hd, G = a->group;
-    const float *K = a->kc + (size_t)kvh * hd, *V = a->vc + (size_t)kvh * hd;
+    const uint16_t *K = a->kc + (size_t)kvh * hd, *V = a->vc + (size_t)kvh * hd;
     float sc[ATTN_MAX_GROUP][ATTN_CHUNK];
+    float row[ATTN_MAX_HEAD_DIM]; /* one K or V row widened to float32 */
 
     const float *qg = a->q + (size_t)kvh * G * hd;
 #ifdef BITNET_NEON
@@ -487,11 +526,12 @@ static void attn_item(void *ctx, size_t item) {
         /* Score pass for 4 query heads per K row: each K element is loaded once
          * and feeds 4 FMAs (vs. one load per FMA with per-head dot products). */
         for (int t = t0; t < t1; t++) {
-            const float *k = K + (size_t)t * a->kv_dim;
+            const uint16_t *k = K + (size_t)t * a->kv_dim;
             float32x4_t s0 = vdupq_n_f32(0.0f), s1 = s0, s2 = s0, s3 = s0;
             float32x4_t u0 = s0, u1 = s0, u2 = s0, u3 = s0;
             for (int i = 0; i < hd; i += 8) {
-                const float32x4_t k0 = vld1q_f32(k + i), k1 = vld1q_f32(k + i + 4);
+                const float16x8_t kh = vreinterpretq_f16_u16(vld1q_u16(k + i));
+                const float32x4_t k0 = vcvt_f32_f16(vget_low_f16(kh)), k1 = vcvt_high_f32_f16(kh);
                 s0 = vfmaq_f32(s0, vld1q_f32(qg + i), k0);
                 u0 = vfmaq_f32(u0, vld1q_f32(qg + i + 4), k1);
                 s1 = vfmaq_f32(s1, vld1q_f32(qg + hd + i), k0);
@@ -510,16 +550,16 @@ static void attn_item(void *ctx, size_t item) {
 #endif
     {
         for (int t = t0; t < t1; t++) {
-            const float *k = K + (size_t)t * a->kv_dim;
-            for (int g = 0; g < G; g++) sc[g][t - t0] = dot_f32(qg + (size_t)g * hd, k, hd) * a->scale;
+            f16_to_f32_row(row, K + (size_t)t * a->kv_dim, hd); /* widened once for G heads */
+            for (int g = 0; g < G; g++) sc[g][t - t0] = dot_f32(qg + (size_t)g * hd, row, hd) * a->scale;
         }
     }
     float *o[ATTN_MAX_GROUP];
     for (int g = 0; g < G; g++) {
-        float *row = sc[g];
-        float mx = row[0];
-        for (int t = 1; t < nt; t++) mx = row[t] > mx ? row[t] : mx;
-        const float l = exp_shift_sum(row, nt, mx);
+        float *sg = sc[g];
+        float mx = sg[0];
+        for (int t = 1; t < nt; t++) mx = sg[t] > mx ? sg[t] : mx;
+        const float l = exp_shift_sum(sg, nt, mx);
         float *slot = a->part + attn_slot(a, kvh * G + g, c);
         slot[0] = mx;
         slot[1] = l;
@@ -536,9 +576,11 @@ static void attn_item(void *ctx, size_t item) {
             for (int g = 0; g < 4; g++)
                 for (int j = 0; j < 4; j++) acc[g][j] = vdupq_n_f32(0.0f);
             for (int t = t0; t < t1; t++) {
-                const float *v = V + (size_t)t * a->kv_dim + i0;
-                const float32x4_t v0 = vld1q_f32(v), v1 = vld1q_f32(v + 4);
-                const float32x4_t v2 = vld1q_f32(v + 8), v3 = vld1q_f32(v + 12);
+                const uint16_t *v = V + (size_t)t * a->kv_dim + i0;
+                const float16x8_t va = vreinterpretq_f16_u16(vld1q_u16(v));
+                const float16x8_t vb = vreinterpretq_f16_u16(vld1q_u16(v + 8));
+                const float32x4_t v0 = vcvt_f32_f16(vget_low_f16(va)), v1 = vcvt_high_f32_f16(va);
+                const float32x4_t v2 = vcvt_f32_f16(vget_low_f16(vb)), v3 = vcvt_high_f32_f16(vb);
                 for (int g = 0; g < 4; g++) {
                     const float p = sc[g][t - t0];
                     acc[g][0] = vfmaq_n_f32(acc[g][0], v0, p);
@@ -554,8 +596,8 @@ static void attn_item(void *ctx, size_t item) {
     }
 #endif
     for (int t = t0; t < t1; t++) {
-        const float *v = V + (size_t)t * a->kv_dim;
-        for (int g = 0; g < G; g++) axpy_f32(o[g], sc[g][t - t0], v, hd);
+        f16_to_f32_row(row, V + (size_t)t * a->kv_dim, hd);
+        for (int g = 0; g < G; g++) axpy_f32(o[g], sc[g][t - t0], row, hd);
     }
 }
 
@@ -564,8 +606,9 @@ size_t attention_scratch_floats(int n_heads, int head_dim, int max_seq_len) {
     return (size_t)n_heads * chunks * (size_t)(head_dim + 2);
 }
 
-void attention_neon(float *out, const float *q, const float *k_cache, const float *v_cache, int pos,
-                    int n_heads, int n_kv_heads, int head_dim, int kv_dim, float *part, threadpool *pool) {
+void attention_neon(float *out, const float *q, const uint16_t *k_cache, const uint16_t *v_cache,
+                    int pos, int n_heads, int n_kv_heads, int head_dim, int kv_dim, float *part,
+                    threadpool *pool) {
     attn_job a = {out, q, k_cache, v_cache, part, pos, n_kv_heads, n_heads / n_kv_heads, head_dim,
                   kv_dim, (pos + ATTN_CHUNK) / ATTN_CHUNK, 1.0f / sqrtf((float)head_dim)};
     const size_t items = (size_t)n_kv_heads * (size_t)a.n_chunks;
@@ -614,8 +657,8 @@ int runstate_init(RunState *s, const BitNetModel *m, int max_seq_len, int n_thre
     const bitnet_config *c = &m->config;
     if (max_seq_len <= 0 || max_seq_len > c->max_seq_len) max_seq_len = c->max_seq_len;
     const int hd = c->head_dim, q_dim = c->n_heads * hd, kv_dim = c->n_kv_heads * hd;
-    if (hd % 2 != 0) {
-        snprintf(err, err_len, "head_dim %d must be even for RoPE", hd);
+    if (hd % 2 != 0 || hd > ATTN_MAX_HEAD_DIM) {
+        snprintf(err, err_len, "head_dim %d must be even and <= %d", hd, ATTN_MAX_HEAD_DIM);
         return -1;
     }
     if (c->n_heads % c->n_kv_heads != 0 || c->n_heads / c->n_kv_heads > ATTN_MAX_GROUP) {
@@ -645,7 +688,8 @@ int runstate_init(RunState *s, const BitNetModel *m, int max_seq_len, int n_thre
         {(void **)&s->logits, (size_t)c->vocab_size * 4},
         {(void **)&s->xq, BQ * s->xq_stride},
         {(void **)&s->yi, B * s->yi_stride * 4},
-        {(void **)&s->key_cache, cache * 4},           {(void **)&s->value_cache, cache * 4},
+        {(void **)&s->kf, B * kv_dim * 4},             {(void **)&s->vf, B * kv_dim * 4},
+        {(void **)&s->key_cache, cache * 2},           {(void **)&s->value_cache, cache * 2},
         {(void **)&s->rope_cos, rope * 4},             {(void **)&s->rope_sin, rope * 4},
     };
     const int n_parts = (int)(sizeof(parts) / sizeof(parts[0]));
@@ -757,25 +801,28 @@ static void forward_chunk(const int32_t *tokens, int n, int pos, const BitNetMod
     for (int l = 0; l < c->n_layers; l++) {
         const bitnet_layer *L = &m->layers[l];
         const size_t layer_off = (size_t)l * s->max_seq_len * kv_dim;
-        float *kc = s->key_cache + layer_off + (size_t)pos * kv_dim;
-        float *vc = s->value_cache + layer_off + (size_t)pos * kv_dim;
+        uint16_t *kc = s->key_cache + layer_off + (size_t)pos * kv_dim;
+        uint16_t *vc = s->value_cache + layer_off + (size_t)pos * kv_dim;
 
-        /* ---- Attention: QKV projections (K/V written straight into the cache). */
+        /* ---- Attention: QKV projections; K gets RoPE in float32, then K and V
+         *      are rounded once into the float16 cache. */
         for (int t = 0; t < n; t++) {
             rmsnorm_neon(ROW(s->xb, t, dim), ROW(s->x, t, dim), L->attn_norm->data, dim, eps);
             gamma[t] = quantize_act_neon(ROW(s->xb, t, dim), ROW(s->xq, t, xs), dim);
         }
         {
             const bitnet_tensor *W[3] = {L->wq, L->wk, L->wv};
-            float *out[3] = {s->q, kc, vc};
+            float *out[3] = {s->q, s->kf, s->vf};
             const size_t os[3] = {(size_t)q_dim, (size_t)kv_dim, (size_t)kv_dim};
             bitlinear_batch(s, n, gamma, dim, W, out, os, 3);
         }
         for (int t = 0; t < n; t++) {
             const size_t rp = (size_t)(pos + t) * (hd / 2);
             apply_rope_neon(ROW(s->q, t, q_dim), c->n_heads, hd, s->rope_cos + rp, s->rope_sin + rp);
-            apply_rope_neon(ROW(kc, t, kv_dim), c->n_kv_heads, hd, s->rope_cos + rp, s->rope_sin + rp);
+            apply_rope_neon(ROW(s->kf, t, kv_dim), c->n_kv_heads, hd, s->rope_cos + rp, s->rope_sin + rp);
         }
+        f32_to_f16_row(kc, s->kf, n * kv_dim); /* rows are contiguous in both */
+        f32_to_f16_row(vc, s->vf, n * kv_dim);
         PROF_MARK(attn_proj);
 
         /* ---- Causal attention for each token over positions 0..pos+t (GQA). */

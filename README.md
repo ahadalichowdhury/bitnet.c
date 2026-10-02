@@ -102,6 +102,11 @@ pthreads: no BLAS, no C++, no Python at runtime.
 - **BitLinear.** Activations are quantized per token to int8 (absmax,
   round-half-to-even, matching PyTorch) and the int32 result is rescaled once
   (`src/bitlinear.h`).
+- **float16 KV cache.** Keys and values are stored as IEEE float16 (300 MiB
+  instead of 600 MiB at the full 4096-token context) and widened to float32
+  inside attention, which accumulates in float32. NEON, F16C and the scalar
+  fallback round identically (verified for every float32 value). Next-token
+  distributions move no more than reordering float sums does (mean KL 0.003).
 - **Attention.** Grouped-query attention reads each key/value row once for the
   four query heads sharing it, splits long contexts into chunks across cores
   and merges them with a log-sum-exp rule (flash-decoding style).
