@@ -94,14 +94,80 @@ static inline int32_t ternary_dot_neon(const int8_t *act, const uint8_t *packed_
     return sum;
 }
 
-#else /* !BITNET_NEON: portable scalar build */
+#elif defined(BITNET_AVX2)
 
-#define TERNARY_DOT_PATH "scalar (no NEON)"
+/* AVX2 block = 32 weights = 8 packed bytes = 32 activations.
+ *   - One PSHUFB replicates packed byte j into output bytes 4j..4j+3 (both
+ *     128-bit lanes hold the 8 bytes; lane 1 indexes bytes 4..7), so output
+ *     byte t holds the byte that contains weight t.
+ *   - AND + CMPEQ against {0x01,0x04,0x10,0x40} / {0x02,0x08,0x20,0x80}
+ *     flags the "+1" bit and the "-1" bit of field t%4 as 0xFF; then
+ *     w = isMinus - isPlus, which maps 00->0, 01->+1, 10->-1, 11->0 exactly
+ *     like k_ternary_lut. No table lookup is needed.
+ *   - _mm256_sign_epi8 would be wrong for a = -128 (-(-128) wraps), so the
+ *     product uses MADDUBS with the unsigned u = w + 1 in {0,1,2}:
+ *       sum(w*a) = maddubs(u, a) - maddubs(1, a)
+ *     Both pair sums lie in [-512, 508] (no int16 saturation) and so does the
+ *     difference, which MADD with ones widens into int32 lanes: exact. */
+#define TERNARY_DOT_PATH "AVX2 (PSHUFB/CMPEQ decode + MADDUBS)"
+
+static inline __m256i ternary_decode32_u_avx2(const uint8_t *p) {
+    const __m256i rep = _mm256_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+                                         4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    const __m256i pm = _mm256_set1_epi32(0x40100401);         /* bytes 01 04 10 40 */
+    const __m256i mm = _mm256_set1_epi32((int)0x80200802u);   /* bytes 02 08 20 80 */
+    const __m256i r = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadl_epi64((const __m128i *)p)), rep);
+    const __m256i plus = _mm256_cmpeq_epi8(_mm256_and_si256(r, pm), pm);
+    const __m256i minus = _mm256_cmpeq_epi8(_mm256_and_si256(r, mm), mm);
+    return _mm256_sub_epi8(_mm256_sub_epi8(minus, plus), _mm256_set1_epi8(-1)); /* w + 1 */
+}
+
+/* int32x8 partial sums of w*a for one block; asum16 = maddubs(1, a). */
+static inline __m256i ternary_block32_avx2(__m256i u, __m256i a, __m256i asum16) {
+    const __m256i d16 = _mm256_sub_epi16(_mm256_maddubs_epi16(u, a), asum16);
+    return _mm256_madd_epi16(d16, _mm256_set1_epi16(1));
+}
+
+static inline int32_t hsum_epi32_avx2(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(s);
+}
+
+/* SIMD entry point (named for the NEON original; AVX2 here). */
+static inline int32_t ternary_dot_neon(const int8_t *act, const uint8_t *packed_w, int size) {
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+    const int full = size & ~31;
+    int i = 0;
+    for (; i + 64 <= full; i += 64) { /* two independent chains */
+        const __m256i a0 = _mm256_loadu_si256((const __m256i *)(act + i));
+        const __m256i a1 = _mm256_loadu_si256((const __m256i *)(act + i + 32));
+        acc0 = _mm256_add_epi32(acc0, ternary_block32_avx2(ternary_decode32_u_avx2(packed_w + (i >> 2)), a0,
+                                                           _mm256_maddubs_epi16(ones8, a0)));
+        acc1 = _mm256_add_epi32(acc1, ternary_block32_avx2(ternary_decode32_u_avx2(packed_w + (i >> 2) + 8), a1,
+                                                           _mm256_maddubs_epi16(ones8, a1)));
+    }
+    for (; i < full; i += 32) {
+        const __m256i a0 = _mm256_loadu_si256((const __m256i *)(act + i));
+        acc0 = _mm256_add_epi32(acc0, ternary_block32_avx2(ternary_decode32_u_avx2(packed_w + (i >> 2)), a0,
+                                                           _mm256_maddubs_epi16(ones8, a0)));
+    }
+    int32_t sum = hsum_epi32_avx2(_mm256_add_epi32(acc0, acc1));
+    /* Tail (< 32 weights); `full` is a multiple of 4 so byte alignment holds. */
+    if (full < size) sum += ternary_dot_scalar_range(act, packed_w, full, size);
+    return sum;
+}
+
+#else /* no SIMD: portable scalar build */
+
+#define TERNARY_DOT_PATH "scalar (no SIMD)"
 
 static inline int32_t ternary_dot_neon(const int8_t *act, const uint8_t *packed_w, int size) {
     return ternary_dot_scalar_range(act, packed_w, 0, size);
 }
 
-#endif /* BITNET_NEON */
+#endif /* BITNET_NEON / BITNET_AVX2 */
 
 #endif /* BITNET_TERNARY_DOT_H */

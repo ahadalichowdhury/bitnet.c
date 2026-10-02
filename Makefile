@@ -22,6 +22,10 @@ endif
 ARCH := $(shell uname -m)
 ifneq (,$(filter arm64 aarch64,$(ARCH)))
 CPUFLAG := -mcpu=native
+else ifneq (,$(filter x86_64 amd64,$(ARCH)))
+# AVX2/FMA kernels; build with `make X86_SIMD=` for x86-64 CPUs without AVX2.
+X86_SIMD ?= -mavx2 -mfma
+CPUFLAG := -march=native $(X86_SIMD)
 else
 CPUFLAG := -march=native
 endif
