@@ -77,9 +77,10 @@ green before merging.
 - [x] **P8: Benchmark vs Microsoft bitnet.cpp** — `tools/bench_compare.sh` +
   `build/bench_llama` (llama-bench's pp/tg definitions). M1, 4 threads:
   pp512 1.09x, tg128 1.67x bitnet.cpp; Xeon 8375C 4 vCPU: pp512 0.65x,
-  tg128 1.16x.
-- [ ] **P8b: x86 prefill** — beat bitnet.cpp's pp512 on x86 (VNNI
-  `VPDPBUSD`, int16 accumulation, larger token tiles in the AVX2 GEMM)
+  tg128 1.16x (before P8b).
+- [x] **P8b: x86 prefill** — VNNI (`VPDPBUSD`) integer kernels, AVX2 + F16C
+  attention, one attention job per prefill chunk. Xeon 8375C 4 vCPU: pp512
+  41.5 -> 77.6 t/s (1.22x bitnet.cpp), tg128 19.0 -> 22.0 t/s (1.36x).
 
 ## C. Reach
 
