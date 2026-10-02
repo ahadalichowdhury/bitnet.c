@@ -83,6 +83,10 @@ pthreads: no BLAS, no C++, no Python at runtime.
   `MADDUBS`/`MADD` accumulate exactly (`maddubs(w+1, a) - maddubs(1, a)`, which
   stays correct for `a = -128` where `PSIGNB` would overflow). CI checks that
   AVX2 and scalar builds produce bit-identical logits.
+- **SIMD weight layout (`.bitnet` v2).** Weights are packed in 128-weight
+  blocks (`I128`) so each shift + mask of a 32-byte load yields 32 consecutive
+  weights, with no per-byte shuffles. Older v1 files still load;
+  `./tools/download_model.sh` upgrades them automatically.
 - **BitLinear.** Activations are quantized per token to int8 (absmax,
   round-half-to-even, matching PyTorch) and the int32 result is rescaled once
   (`src/bitlinear.h`).

@@ -78,8 +78,14 @@ ok "SHA-256 $WEIGHTS_SHA256"
 
 # ---- 2. convert -------------------------------------------------------------------
 step "Converting to ${OUT#$ROOT/}"
+# Format version (u32 at byte 4): v1 files are upgraded to the v2 SIMD layout.
+fmt_version() { python3 -c "import struct,sys; print(struct.unpack('<I', open(sys.argv[1],'rb').read(8)[4:8])[0])" "$1" 2>/dev/null || echo 0; }
+if [ -f "$OUT" ] && [ "$(fmt_version "$OUT")" -lt 2 ]; then
+    printf '    %s!%s %s is format v1: re-converting to v2 (faster SIMD weight layout)\n' "$Y" "$N" "${OUT#$ROOT/}"
+    rm -f "$OUT"
+fi
 if [ -f "$OUT" ] && [ -f "${OUT%.bitnet}.ref" ]; then
-    ok "already converted"
+    ok "already converted (format v$(fmt_version "$OUT"))"
 else
     command -v python3 >/dev/null || die "python3 is required for the conversion"
     python3 -c "import numpy" 2>/dev/null || die "numpy is required: python3 -m pip install numpy"

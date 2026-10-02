@@ -86,6 +86,7 @@ static const char *dtype_name(uint32_t dt) {
     case BITNET_DTYPE_F32:     return "f32";
     case BITNET_DTYPE_F16:     return "f16";
     case BITNET_DTYPE_TERNARY: return "ternary";
+    case BITNET_DTYPE_TERNARY_I128: return "ternary-i128";
     }
     return "invalid";
 }
@@ -97,6 +98,7 @@ static uint64_t expected_nbytes(uint32_t dtype, uint32_t rows, uint32_t cols) {
     case BITNET_DTYPE_F32:     return r * c * 4u;  /* rows, cols < 2^32: no overflow */
     case BITNET_DTYPE_F16:     return r * c * 2u;
     case BITNET_DTYPE_TERNARY: return r * ((c + 3u) / 4u);
+    case BITNET_DTYPE_TERNARY_I128: return r * (((c + 127u) / 128u) * 32u);
     }
     return 0;
 }
@@ -121,8 +123,9 @@ static int validate_header(const bitnet_file_header *h, const uint8_t *map, size
                            char *err, size_t err_len) {
     if (memcmp(h->magic, BITNET_MAGIC, 4) != 0)
         return fail(err, err_len, "bad magic (not a .bitnet file)");
-    if (h->version != BITNET_VERSION)
-        return fail(err, err_len, "unsupported version %u (expected %u)", h->version, BITNET_VERSION);
+    if (h->version < BITNET_VERSION_MIN || h->version > BITNET_VERSION)
+        return fail(err, err_len, "unsupported version %u (this build reads %u..%u)", h->version,
+                    BITNET_VERSION_MIN, BITNET_VERSION);
     if (h->header_size != BITNET_HEADER_SIZE || h->entry_size != BITNET_ENTRY_SIZE)
         return fail(err, err_len, "unexpected header_size %u / entry_size %u",
                     h->header_size, h->entry_size);
@@ -179,14 +182,14 @@ static int validate_tensor(const bitnet_file_tensor *e, int idx, const bitnet_fi
                            char *err, size_t err_len) {
     if (!memchr(e->name, '\0', BITNET_NAME_LEN) || e->name[0] == '\0')
         return fail(err, err_len, "tensor %d: name is empty or not NUL-terminated", idx);
-    if (e->dtype > BITNET_DTYPE_TERNARY)
+    if (e->dtype > BITNET_DTYPE_TERNARY_I128 || (e->dtype == BITNET_DTYPE_TERNARY_I128 && h->version < 2))
         return fail(err, err_len, "%s: invalid dtype %u", e->name, e->dtype);
     if (e->ndim < 1 || e->ndim > 2 || e->rows == 0 || e->cols == 0 ||
         (e->ndim == 1 && e->cols != 1) || e->rows > (uint32_t)INT32_MAX ||
         e->cols > (uint32_t)INT32_MAX)
         return fail(err, err_len, "%s: invalid shape (ndim %u, %u x %u)",
                     e->name, e->ndim, e->rows, e->cols);
-    if (e->dtype == BITNET_DTYPE_TERNARY && e->ndim != 2)
+    if ((e->dtype == BITNET_DTYPE_TERNARY || e->dtype == BITNET_DTYPE_TERNARY_I128) && e->ndim != 2)
         return fail(err, err_len, "%s: ternary tensors must be 2-D", e->name);
     if (e->offset % BITNET_ALIGN != 0)
         return fail(err, err_len, "%s: offset %llu not %u-byte aligned",
@@ -234,7 +237,7 @@ static int bind_model(bitnet_model *m, char *err, size_t err_len) {
     const int d = c->dim, hd = c->hidden_dim;
     const int q_out = c->n_heads * c->head_dim, kv_out = c->n_kv_heads * c->head_dim;
     const unsigned F = DT(BITNET_DTYPE_F32), E = DT(BITNET_DTYPE_F32) | DT(BITNET_DTYPE_F16),
-                   T = DT(BITNET_DTYPE_TERNARY);
+                   T = DT(BITNET_DTYPE_TERNARY) | DT(BITNET_DTYPE_TERNARY_I128);
     const int sub = (c->flags & BITNET_FLAG_SUB_NORMS) != 0;
     int bound = 0;
 

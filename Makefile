@@ -145,6 +145,8 @@ test-mock: tests | $(BUILD)
 	$(BUILD)/test_gemv --quick | grep -E "PASSED"
 	$(BUILD)/test_bitlinear --quick | grep -E "PASSED"
 	$(BUILD)/test_loader $(MOCK)/mock.bitnet --ref $(MOCK)/mock.ref --corrupt-tests --tmpdir $(MOCK) | grep -E "PASSED"
+	python3 tools/export_bitnet.py --mock --layout row4 --output $(MOCK)/mock_v1.bitnet --ref $(MOCK)/mock_v1.ref 2>/dev/null
+	$(BUILD)/test_loader $(MOCK)/mock_v1.bitnet --ref $(MOCK)/mock_v1.ref | grep -E "Reference check" | sed 's/^/[v1 file] /'
 	$(BUILD)/test_generate --unit-only | grep -E "PASSED"
 	@if [ -f $(TOKENIZER) ]; then $(BUILD)/test_tokenizer $(TOKENIZER) $(GOLDEN) --tmpdir $(MOCK) | grep -E "PASSED" && \
 	  $(BUILD)/test_transformer $(MOCK)/mock.bitnet $(TOKENIZER) $(MOCK)/mock.ref_logits | grep -E "PASSED|->"; \

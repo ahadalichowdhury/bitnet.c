@@ -6,15 +6,19 @@
  * costs O(header + tensor table) regardless of model size and weights are
  * paged in lazily by the kernel on first use.
  *
- * .bitnet format, version 1 (little-endian):
+ * .bitnet format, version 2 (little-endian; version 1 files are still read):
  *   [0, 256)        bitnet_file_header (header_crc32 covers it, crc field zeroed)
  *   [table_offset)  n_tensors x bitnet_file_tensor (table_crc32)
  *   [data_offset)   tensor payloads, each 64-byte aligned, each with a crc32
  *
  * Tensor dtypes:
  *   F32 / F16   row-major
- *   TERNARY     rows x ceil(cols/4) bytes, the exact layout of ternary_dot.h /
- *               gemv.h (00 = 0, 01 = +1, 10 = -1, LSB first); `scale` = beta.
+ *   TERNARY     ROW4 layout: rows x ceil(cols/4) bytes, weight k in byte k/4
+ *               at bits 2*(k%4) (00 = 0, 01 = +1, 10 = -1); `scale` = beta.
+ *   TERNARY_I128 (v2 only) same codes, SIMD-friendly: each row is ceil(cols/128)
+ *               blocks of 32 bytes; byte j of a block holds weights j, 32+j,
+ *               64+j, 96+j at bits 0, 2, 4, 6, so one shift + mask yields 32
+ *               consecutive weights (ternary_dot.h). Written by default.
  *
  * The loader validates everything before exposing a pointer: magic, version,
  * CRCs of header and table, config sanity, every tensor's bounds, alignment,
@@ -34,7 +38,8 @@
 #endif
 
 #define BITNET_MAGIC        "BITN" /* bytes 0x42 0x49 0x54 0x4E */
-#define BITNET_VERSION      1u
+#define BITNET_VERSION      2u /* newest format written; v1 files are still read */
+#define BITNET_VERSION_MIN  1u
 #define BITNET_HEADER_SIZE  256u
 #define BITNET_ENTRY_SIZE   96u
 #define BITNET_NAME_LEN     48u
@@ -50,7 +55,8 @@ enum {
 typedef enum {
     BITNET_DTYPE_F32     = 0,
     BITNET_DTYPE_F16     = 1,
-    BITNET_DTYPE_TERNARY = 2,
+    BITNET_DTYPE_TERNARY = 2,      /* ROW4 layout (v1 and v2 files) */
+    BITNET_DTYPE_TERNARY_I128 = 3, /* SIMD-friendly I128 layout, ternary_dot.h (v2 only) */
 } bitnet_dtype;
 
 typedef enum {

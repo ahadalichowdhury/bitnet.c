@@ -5,7 +5,7 @@
  *
  *   1. Loads (mmap, zero-copy) and validates the model; prints config + tensors.
  *   2. Verifies every payload CRC.
- *   3. --ref: for every ternary tensor, runs gemv_bitnet_neon and gemv_scalar
+ *   3. --ref: for every ternary tensor (either layout), runs the SIMD and scalar GEMV
  *      directly on the mapped weights with the exporter's random int8 input and
  *      requires the int32 output to equal the one Python computed from the
  *      unpacked ternary matrix (proves bit layout + scale compatibility). Also
@@ -94,7 +94,7 @@ static void print_summary(const bitnet_model *m) {
         const bitnet_tensor *t = &m->tensors[i];
         bytes[t->dtype] += t->nbytes;
         count[t->dtype]++;
-        if (t->dtype == BITNET_DTYPE_TERNARY) params_ternary += (size_t)t->rows * t->cols;
+        if (t->dtype == BITNET_DTYPE_TERNARY || t->dtype == BITNET_DTYPE_TERNARY_I128) params_ternary += (size_t)t->rows * t->cols;
     }
     printf("Tensors: %d total | ternary %zu (%.1f MiB, %.1f M params) | f16 %zu (%.1f MiB) | "
            "f32 %zu (%.2f MiB)\n", m->n_tensors, count[2], bytes[2] / 1048576.0,
@@ -160,13 +160,14 @@ static void verify_reference(const bitnet_model *m, const char *ref_path) {
             fprintf(stderr, "ref tensor %s not in model\n", name);
             exit(EXIT_FAILURE);
         }
-        assert(t->dtype == BITNET_DTYPE_TERNARY);
+        assert(t->dtype == BITNET_DTYPE_TERNARY || t->dtype == BITNET_DTYPE_TERNARY_I128);
         assert(t->rows == (int)M && t->cols == (int)K);
         assert(t->scale == beta);
         assert(((uintptr_t)t->data & 63) == 0);
 
-        gemv_bitnet_neon(x, (const uint8_t *)t->data, yn, (int)M, (int)K);
-        gemv_scalar(x, (const uint8_t *)t->data, ys, (int)M, (int)K);
+        const ternary_layout L = t->dtype == BITNET_DTYPE_TERNARY_I128 ? TERNARY_I128 : TERNARY_ROW4;
+        gemv_bitnet_layout(x, (const uint8_t *)t->data, yn, (int)M, (int)K, L, 1);
+        gemv_scalar_layout(x, (const uint8_t *)t->data, ys, (int)M, (int)K, L);
         for (uint32_t i = 0; i < M; i++) {
             if (yn[i] != ye[i] || ys[i] != ye[i]) {
                 fprintf(stderr, "MISMATCH %s row %u: python=%d neon=%d scalar=%d\n",
@@ -271,7 +272,7 @@ static void apply(corruption k, image *im) {
     case C_TRUNC_1:     im->n -= 1; break;
     case C_TRUNC_SMALL: im->n = 100; break;
     case C_MAGIC:       im->b[0] = 'X'; break;
-    case C_VERSION:     h->version = 2; break;
+    case C_VERSION:     h->version = BITNET_VERSION + 1; break;
     case C_HEADER_FLIP: h->dim ^= 1u; break;
     case C_TABLE_FLIP:  entry_at(im, 0)->rows ^= 1u; break;
     case C_MISALIGNED:  entry_at(im, 1)->offset += 1; break;
@@ -371,8 +372,9 @@ static double gemv_pass_ms(const bitnet_model *m, int8_t *x, int32_t *y) {
     const uint64_t t0 = now_ns();
     for (int i = 0; i < m->n_tensors; i++) {
         const bitnet_tensor *t = &m->tensors[i];
-        if (t->dtype != BITNET_DTYPE_TERNARY) continue;
-        gemv_bitnet_neon(x, (const uint8_t *)t->data, y, t->rows, t->cols);
+        if (t->dtype != BITNET_DTYPE_TERNARY && t->dtype != BITNET_DTYPE_TERNARY_I128) continue;
+        gemv_bitnet_layout(x, (const uint8_t *)t->data, y, t->rows, t->cols,
+                           t->dtype == BITNET_DTYPE_TERNARY_I128 ? TERNARY_I128 : TERNARY_ROW4, 1);
         __asm__ volatile("" : : "r"(y) : "memory");
     }
     return (double)(now_ns() - t0) / 1e6;
@@ -400,7 +402,7 @@ static void run_benchmark(const char *path) {
     int max_m = 0, max_k = 0;
     size_t tern_bytes = 0;
     for (int i = 0; i < m.n_tensors; i++) {
-        if (m.tensors[i].dtype != BITNET_DTYPE_TERNARY) continue;
+        if (m.tensors[i].dtype != BITNET_DTYPE_TERNARY && m.tensors[i].dtype != BITNET_DTYPE_TERNARY_I128) continue;
         if (m.tensors[i].rows > max_m) max_m = m.tensors[i].rows;
         if (m.tensors[i].cols > max_k) max_k = m.tensors[i].cols;
         tern_bytes += m.tensors[i].nbytes;
