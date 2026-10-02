@@ -28,6 +28,8 @@ jobs:
           build-avx2-exact/test_transformer build/mock/mock.bitnet $T build/mock/mock.ref_logits --no-unit-tests --dump-logits avx2.f32 | grep "Logits dump"
           build-scalar/test_transformer build/mock/mock.bitnet $T build/mock/mock.ref_logits --no-unit-tests --dump-logits scalar.f32 | grep "Logits dump"
           cmp avx2.f32 scalar.f32 && echo "AVX2 and scalar logits are bit-identical ($(wc -c < avx2.f32) bytes)"
+      - name: F16C float16 KV-cache conversion == scalar for every float32
+        run: build/test_transformer build/mock/mock.bitnet models/hf/bitnet-b1.58-2B-4T/tokenizer.json --exhaustive-f16 --quick | grep "f16 KV cache"
       - name: Shared library + Python bindings
         run: |
           make lib

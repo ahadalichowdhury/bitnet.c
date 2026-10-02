@@ -205,6 +205,87 @@ static void kernel_tests(void) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* float16 KV-cache conversions: SIMD rows == scalar, bit for bit             */
+/* ------------------------------------------------------------------------- */
+
+static uint32_t f32_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float bits_f32(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+/* Converts src[n] with f32_to_f16_row and checks each half against float_to_half. */
+static long check_f32_to_f16(const float *src, uint16_t *dst, int n) {
+    f32_to_f16_row(dst, src, n);
+    for (int i = 0; i < n; i++) {
+        const uint16_t ref = float_to_half(src[i]);
+        if (src[i] != src[i]) { /* NaN: any quiet NaN of the same sign */
+            assert((dst[i] & 0x7C00u) == 0x7C00u && (dst[i] & 0x3FFu) && (dst[i] & 0x8000u) == (ref & 0x8000u));
+            continue;
+        }
+        if (dst[i] != ref)
+            fprintf(stderr, "f16 MISMATCH %a (0x%08x): row 0x%04x, float_to_half 0x%04x\n",
+                    (double)src[i], f32_bits(src[i]), dst[i], ref);
+        assert(dst[i] == ref);
+    }
+    return n;
+}
+
+static void f16_tests(int exhaustive) {
+    enum { CH = 1 << 16 };
+    float *f = xmalloc(CH * 4);
+    uint16_t *h = xmalloc(CH * 2);
+    long n = 0;
+
+    /* f16 -> f32: exact for all 65536 halves (row path == half_to_float). */
+    for (uint32_t i = 0; i < CH; i++) h[i] = (uint16_t)i;
+    f16_to_f32_row(f, h, CH);
+    for (uint32_t i = 0; i < CH; i++) {
+        const float ref = half_to_float((uint16_t)i);
+        assert(f32_bits(f[i]) == f32_bits(ref) || (f[i] != f[i] && ref != ref));
+        if (ref == ref) assert(float_to_half(ref) == (uint16_t)i); /* round trip */
+    }
+
+    /* f32 -> f16 rounding: every gap between adjacent halves, at the tie
+     * (must round to the even half), just below and just above it, and both
+     * signs; plus the overflow threshold and the subnormal range. */
+    int k = 0;
+    for (uint32_t i = 0; i < 0x7C00u; i++) {
+        const double lo = half_to_float((uint16_t)i), hi = i + 1 < 0x7C00u ? half_to_float((uint16_t)(i + 1)) : 65536.0;
+        const float mid = (float)((lo + hi) / 2); /* exact: 12 significant bits */
+        const float cand[5] = {(float)lo, mid, nextafterf(mid, 0.0f), nextafterf(mid, INFINITY), nextafterf((float)lo, INFINITY)};
+        for (int c = 0; c < 5; c++)
+            for (int sg = 0; sg < 2; sg++) {
+                f[k++] = sg ? -cand[c] : cand[c];
+                if (k == CH) { n += check_f32_to_f16(f, h, k); k = 0; }
+            }
+        const uint16_t tie = float_to_half(mid); /* independent RNE check: tie -> even */
+        assert(tie == ((i & 1u) ? i + 1 : i));
+    }
+    n += check_f32_to_f16(f, h, k);
+
+    /* Random bit patterns (all exponents, NaN/inf included), odd lengths for
+     * the scalar tails. */
+    uint64_t r = 0x243F6A8885A308D3ull;
+    for (int rep = 0; rep < 64; rep++) {
+        const int len = CH - (rep % 9);
+        for (int i = 0; i < len; i++) {
+            r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+            f[i] = bits_f32((uint32_t)r);
+        }
+        n += check_f32_to_f16(f, h, len);
+    }
+
+    /* Optional: every float32 bit pattern (4.3e9 values). */
+    if (exhaustive) {
+        for (uint64_t base = 0; base < (1ull << 32); base += CH) {
+            for (uint32_t i = 0; i < CH; i++) f[i] = bits_f32((uint32_t)(base + i));
+            n += check_f32_to_f16(f, h, CH);
+        }
+    }
+    free(f); free(h);
+    printf("f16 KV cache:   PASSED (%ld float32 -> float16 conversions%s == float_to_half incl. ties to even, "
+           "subnormals, overflow; all 65536 halves widen exactly)\n", n, exhaustive ? " (every float32)" : "");
+}
+
+/* ------------------------------------------------------------------------- */
 /* Thread pool and attention unit tests                                      */
 /* ------------------------------------------------------------------------- */
 
@@ -253,7 +334,13 @@ static void attention_tests(void) {
     float *part = xmalloc(attention_scratch_floats(nh, hd, T) * 4);
     double *sc = xmalloc((size_t)T * sizeof(double));
     for (int i = 0; i < nh * hd; i++) q[i] = 2.0f * frand();
-    for (size_t i = 0; i < (size_t)T * kv_dim; i++) { K[i] = frand(); V[i] = frand(); }
+    uint16_t *K16 = xmalloc((size_t)T * kv_dim * 2), *V16 = xmalloc((size_t)T * kv_dim * 2);
+    for (size_t i = 0; i < (size_t)T * kv_dim; i++) { /* the reference uses the stored float16 values */
+        K16[i] = float_to_half(frand());
+        V16[i] = float_to_half(frand());
+        K[i] = half_to_float(K16[i]);
+        V[i] = half_to_float(V16[i]);
+    }
     char err[128];
     threadpool *pool = threadpool_create(0, err, sizeof(err));
     assert(pool);
@@ -263,7 +350,7 @@ static void attention_tests(void) {
     for (size_t pi = 0; pi < sizeof(ps) / sizeof(ps[0]); pi++) {
         const int pos = ps[pi];
         for (int use_pool = 0; use_pool < 2; use_pool++) {
-            attention_neon(out, q, K, V, pos, nh, nkv, hd, kv_dim, part, use_pool ? pool : NULL);
+            attention_neon(out, q, K16, V16, pos, nh, nkv, hd, kv_dim, part, use_pool ? pool : NULL);
             for (int h = 0; h < nh; h++) {
                 const int kvh = h / G; /* HF repeat_kv: head h uses kv head h / group */
                 double mx = -INFINITY, sum = 0;
@@ -289,7 +376,7 @@ static void attention_tests(void) {
            "serial; max abs err vs float64 %.1e)\n", nh, nkv, hd, sizeof(ps) / sizeof(ps[0]), T - 1,
            ATTN_CHUNK, worst);
     threadpool_destroy(pool);
-    free(q); free(out); free(K); free(V); free(part); free(sc);
+    free(q); free(out); free(K); free(V); free(K16); free(V16); free(part); free(sc);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -358,8 +445,8 @@ static void verify_reference(const BitNetModel *m, const Tokenizer *tk, RunState
     const int V = m->config.vocab_size;
     assert(r->V == V);
     float *first = xmalloc((size_t)r->T * V * sizeof(float));
-    double worst_cos = 1, worst_nrmse = 0;
-    int top1 = 0, top5_overlap = 0;
+    double worst_cos = 1, worst_nrmse = 0, sum_nrmse = 0;
+    int top1 = 0, top5_overlap = 0, decisive = 0, decisive_ok = 0, ties_ok = 0;
 
     printf("\nReference parity (C incremental KV-cache path vs numpy float64 prefill of the HF checkpoint):\n");
     if (r->T <= 24)
@@ -384,25 +471,45 @@ static void verify_reference(const BitNetModel *m, const Tokenizer *tk, RunState
             for (int j = 0; j < 5; j++) ov += a[i] == b[j];
         top1 += a[0] == b[0];
         top5_overlap += ov;
+        /* A reference near-tie (top-2 within 0.5 logits) may legitimately swap
+         * under any rounding difference; elsewhere top-1 must match exactly. */
+        if (ref[b[0]] - ref[b[1]] >= 0.5f) {
+            decisive++;
+            decisive_ok += a[0] == b[0];
+        } else {
+            ties_ok += a[0] == b[0] || a[0] == b[1];
+        }
         worst_cos = fmin(worst_cos, cosv);
         worst_nrmse = fmax(worst_nrmse, nrmse);
+        sum_nrmse += nrmse;
         char s1[64], s2[64], s3[64];
         if (r->T <= 24) printf("  %3d  %-14s %-17s %-17s %.6f  %.2e   %d/5\n", t, tok_str(tk, r->tokens[t], s1, 64),
                tok_str(tk, a[0], s2, 64), tok_str(tk, b[0], s3, 64), cosv, nrmse, ov);
     }
-    printf("  -> top-1 agreement %d/%d, mean top-5 overlap %.2f/5, worst cosine %.6f, worst nRMSE %.2e\n",
-           top1, r->T, (double)top5_overlap / r->T, worst_cos, worst_nrmse);
+    const double mean_nrmse = sum_nrmse / r->T;
+    printf("  -> top-1 agreement %d/%d (%d/%d where the reference margin is >= 0.5 logits), mean top-5 "
+           "overlap %.2f/5, worst cosine %.6f, worst nRMSE %.2e, mean nRMSE %.2e\n", top1, r->T, decisive_ok,
+           decisive, (double)top5_overlap / r->T, worst_cos, worst_nrmse, mean_nrmse);
     /* Tolerances come from the measured noise floor between two *correct*
      * implementations: the numpy reference in float32 vs float64 differs by up
      * to nRMSE 5.4e-2 / cosine 0.99929 on this 2B model (1.7e-2 / 0.99986 on a
      * 2-layer mock), because a 1-ulp difference can flip an int8 activation
      * rounding at a .5 boundary and the flip propagates through later layers.
-     * Pos 0 has no such freedom and matches to ~3e-7. Allow 2x the floor;
-     * structural bugs (GQA mapping, RoPE layout/sign, causal range, scale) give
-     * nRMSE ~1 (see the mutation tests in the Step 6 report). */
-    assert(top1 == r->T);
+     * Structural bugs (GQA mapping, RoPE layout/sign, causal range, scale)
+     * give nRMSE ~1 (see the mutation tests in the Step 6 report).
+     *
+     * The int8 output layer and the float16 KV cache each add one rounding
+     * that the same int8 flips amplify, mostly at single positions: on the 2B
+     * model the worst position (BOS, whose attention output is exactly its
+     * float16 V row) reaches nRMSE 1.4e-1 / cosine 0.9947 while the mean over
+     * positions is 4.4e-2. Over 1200 tokens of text the float16 cache shifts
+     * the next-token distribution by mean KL 0.0029, the same as merely
+     * reordering float sums (NEON vs scalar build: 0.0027), and perplexity
+     * 26.46 -> 26.43. So bound the mean tightly and the worst position loosely. */
+    assert(decisive_ok == decisive && ties_ok == r->T - decisive);
     assert((double)top5_overlap / r->T >= 4.5);
-    assert(worst_cos > 0.995 && worst_nrmse < 0.12);
+    assert(mean_nrmse < 0.06);
+    assert(worst_cos > 0.99 && worst_nrmse < 0.2);
 
     /* KV cache determinism: a second run must be bit-identical. */
     for (int t = 0; t < r->T; t++) {
@@ -438,14 +545,14 @@ static void batch_check(const BitNetModel *m, RunState *s, int bench) {
         toks[i] = (int32_t)((lcg >> 33) % (uint64_t)V);
     }
     const size_t layer = (size_t)s->max_seq_len * kv_dim, span = (size_t)N * kv_dim;
-    float *kref = malloc((size_t)c->n_layers * span * 4), *vref = malloc((size_t)c->n_layers * span * 4);
+    uint16_t *kref = malloc((size_t)c->n_layers * span * 2), *vref = malloc((size_t)c->n_layers * span * 2);
     float *lref = malloc((size_t)V * 4);
     assert(kref && vref && lref);
     for (int i = 0; i < N; i++) transformer_forward_ex(toks[i], i, m, s, i == N - 1);
     memcpy(lref, s->logits, (size_t)V * 4);
     for (int l = 0; l < c->n_layers; l++) {
-        memcpy(kref + l * span, s->key_cache + l * layer, span * 4);
-        memcpy(vref + l * span, s->value_cache + l * layer, span * 4);
+        memcpy(kref + l * span, s->key_cache + l * layer, span * 2);
+        memcpy(vref + l * span, s->value_cache + l * layer, span * 2);
     }
     /* Schedules: (first single tokens, then chunk sizes) covering ragged
      * GEMM_TB groups, TRANSFORMER_BATCH splits and nonzero start positions. */
@@ -459,8 +566,8 @@ static void batch_check(const BitNetModel *m, RunState *s, int bench) {
     const int nsched = (int)(sizeof(sched) / sizeof(sched[0]));
     for (int k = 0; k < nsched; k++) {
         for (int l = 0; l < c->n_layers; l++) { /* poison the cache span */
-            memset(s->key_cache + l * layer, 0xFF, span * 4);
-            memset(s->value_cache + l * layer, 0xFF, span * 4);
+            memset(s->key_cache + l * layer, 0xFF, span * 2);
+            memset(s->value_cache + l * layer, 0xFF, span * 2);
         }
         memset(s->logits, 0xFF, (size_t)V * 4);
         int pos = 0;
@@ -472,8 +579,8 @@ static void batch_check(const BitNetModel *m, RunState *s, int bench) {
         assert(pos == N);
         assert(memcmp(lref, s->logits, (size_t)V * 4) == 0);
         for (int l = 0; l < c->n_layers; l++) {
-            assert(memcmp(kref + l * span, s->key_cache + l * layer, span * 4) == 0);
-            assert(memcmp(vref + l * span, s->value_cache + l * layer, span * 4) == 0);
+            assert(memcmp(kref + l * span, s->key_cache + l * layer, span * 2) == 0);
+            assert(memcmp(vref + l * span, s->value_cache + l * layer, span * 2) == 0);
         }
     }
     printf("Batched prefill: PASSED (%d schedules of %d tokens, chunks of 1..%d: KV cache of all %d "
@@ -590,11 +697,12 @@ static void benchmark(const BitNetModel *m, const Tokenizer *tk, RunState *s, in
 
 int main(int argc, char **argv) {
     const char *model_path = NULL, *tok_path = NULL, *ref_path = NULL;
-    int quick = 0, n_threads = 0, unit = 1;
+    int quick = 0, n_threads = 0, unit = 1, exhaustive_f16 = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--quick") == 0) quick = 1;
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--no-unit-tests") == 0) unit = 0;
+        else if (strcmp(argv[i], "--exhaustive-f16") == 0) exhaustive_f16 = 1;
         else if (strcmp(argv[i], "--dump-logits") == 0 && i + 1 < argc) g_dump_logits = argv[++i];
         else if (!model_path) model_path = argv[i];
         else if (!tok_path) tok_path = argv[i];
@@ -603,12 +711,13 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0); /* progress survives a crash in logs */
     if (!model_path || !tok_path) {
         fprintf(stderr, "usage: %s MODEL.bitnet TOKENIZER.json [REF.ref_logits] [--quick] "
-                "[--threads N] [--no-unit-tests]\n", argv[0]);
+                "[--threads N] [--no-unit-tests] [--exhaustive-f16]\n", argv[0]);
         return 2;
     }
 
     if (unit) {
         kernel_tests();
+        f16_tests(exhaustive_f16);
         pool_tests();
         attention_tests();
     }

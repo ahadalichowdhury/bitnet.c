@@ -61,8 +61,12 @@ typedef struct {
     int32_t *yi;     /* rows of yi_stride = q_dim + 2*kv_dim + 2*hidden_dim + dim: int32 outputs */
     size_t   xq_stride, yi_stride;
 
-    float   *key_cache;   /* [n_layers][max_seq_len][kv_dim] */
-    float   *value_cache; /* [n_layers][max_seq_len][kv_dim] */
+    float   *kf, *vf;     /* [kv_dim] float32 K/V of new tokens (RoPE runs here) */
+
+    /* KV cache in IEEE float16 (bits), half the memory of float32; values are
+     * rounded once (round-half-to-even) and attention accumulates in float32. */
+    uint16_t *key_cache;   /* [n_layers][max_seq_len][kv_dim] */
+    uint16_t *value_cache; /* [n_layers][max_seq_len][kv_dim] */
     float   *rope_cos;    /* [max_seq_len][head_dim/2] */
     float   *rope_sin;    /* [max_seq_len][head_dim/2] */
 
@@ -128,17 +132,25 @@ void gemv_f16_neon(const uint16_t *W, const float *x, float *out, int M, int K, 
 #define ATTN_CHUNK 256
 #endif
 #define ATTN_MAX_GROUP 8 /* max n_heads / n_kv_heads */
+#define ATTN_MAX_HEAD_DIM 256
 
 /* Causal GQA attention of one query position over cached positions 0..pos.
  *   q:        [n_heads * head_dim] (RoPE applied)
- *   k_cache, v_cache: this layer's cache, position t at offset t * kv_dim
+ *   k_cache, v_cache: this layer's float16 cache, position t at offset t * kv_dim
  *   out:      [n_heads * head_dim]
  *   part:     scratch of attention_scratch_floats(...) floats
  * Work items are (kv head, chunk of ATTN_CHUNK positions): each K/V row is
  * read once for all query heads of its group, and chunk results are merged
  * with the log-sum-exp rule (flash-decoding). pool may be NULL. */
-void attention_neon(float *out, const float *q, const float *k_cache, const float *v_cache, int pos,
-                    int n_heads, int n_kv_heads, int head_dim, int kv_dim, float *part, threadpool *pool);
+void attention_neon(float *out, const float *q, const uint16_t *k_cache, const uint16_t *v_cache,
+                    int pos, int n_heads, int n_kv_heads, int head_dim, int kv_dim, float *part,
+                    threadpool *pool);
+
+/* Row conversions float32 <-> IEEE float16 bits (NEON / F16C / scalar).
+ * f32_to_f16_row rounds to nearest even and is bit-identical to float_to_half
+ * (platform.h) on every path for all non-NaN inputs; f16_to_f32_row is exact. */
+void f32_to_f16_row(uint16_t *out, const float *x, int n);
+void f16_to_f32_row(float *out, const uint16_t *h, int n);
 size_t attention_scratch_floats(int n_heads, int head_dim, int max_seq_len);
 
 #endif /* BITNET_TRANSFORMER_H */
