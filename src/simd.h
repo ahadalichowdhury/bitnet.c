@@ -18,6 +18,16 @@
  * compiler auto-vectorizes. */
 #define BITNET_AVX2 1
 #include <immintrin.h>
+/* F16C (VCVTPH2PS) for the float16 output layer; BITNET_NO_F16C keeps the
+ * scalar conversion so AVX2 and scalar builds can be compared bit-for-bit. */
+#if defined(__F16C__) && !defined(BITNET_NO_F16C)
+#define BITNET_F16C 1
+#endif
+#if defined(__FMA__)
+#define BITNET_FMADD(a, b, c) _mm256_fmadd_ps((a), (b), (c))
+#else
+#define BITNET_FMADD(a, b, c) _mm256_add_ps(_mm256_mul_ps((a), (b)), (c))
+#endif
 #endif
 
 #endif /* BITNET_SIMD_H */

@@ -37,6 +37,7 @@
 
 #include "model_loader.h"
 #include "platform.h"
+#include "simd.h"
 #include "threadpool.h"
 #include "tokenizer.h"
 #include "transformer.h"
@@ -164,6 +165,19 @@ static void kernel_tests(void) {
     residual_add_neon(y, w, N);
     for (int i = 0; i < N; i++) assert(y[i] == x[i] + w[i]);
 
+#ifdef BITNET_F16C
+    /* F16C conversion is exact: VCVTPH2PS == half_to_float for all 65536 halves. */
+    for (uint32_t h0 = 0; h0 < 65536; h0 += 8) {
+        uint16_t hv[8];
+        float fv[8];
+        for (int j = 0; j < 8; j++) hv[j] = (uint16_t)(h0 + (uint32_t)j);
+        _mm256_storeu_ps(fv, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)hv)));
+        for (int j = 0; j < 8; j++) {
+            const float ref = half_to_float(hv[j]);
+            assert(memcmp(&fv[j], &ref, 4) == 0 || (fv[j] != fv[j] && ref != ref));
+        }
+    }
+#endif
     /* f16 GEMV vs float64 (M not a multiple of the row block, K with a tail). */
     const int M = 1000, K = 2570;
     uint16_t *W16 = xmalloc((size_t)M * K * 2);

@@ -307,6 +307,29 @@ static void f16_rows(void *ctx_, size_t blk) {
             a3 = vfmaq_f32(a3, vcvt_high_f32_f16(h1), vld1q_f32(c->x + k + 12));
         }
         float s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+#elif defined(BITNET_F16C)
+        /* x86 F16C: VCVTPH2PS widens 8 halves per instruction (exactly, like
+         * half_to_float); four independent FMA chains of 8 lanes. */
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int k = 0;
+        for (; k + 32 <= c->K; k += 32) {
+            a0 = BITNET_FMADD(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + k))),
+                              _mm256_loadu_ps(c->x + k), a0);
+            a1 = BITNET_FMADD(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + k + 8))),
+                              _mm256_loadu_ps(c->x + k + 8), a1);
+            a2 = BITNET_FMADD(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + k + 16))),
+                              _mm256_loadu_ps(c->x + k + 16), a2);
+            a3 = BITNET_FMADD(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + k + 24))),
+                              _mm256_loadu_ps(c->x + k + 24), a3);
+        }
+        for (; k + 8 <= c->K; k += 8)
+            a0 = BITNET_FMADD(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + k))),
+                              _mm256_loadu_ps(c->x + k), a0);
+        const __m256 v = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        __m128 h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+        h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 1));
+        float s = _mm_cvtss_f32(h);
 #else
         float s = 0.0f;
         int k = 0;
