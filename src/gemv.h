@@ -65,6 +65,84 @@ static inline void gemv_scalar(const int8_t *act, const uint8_t *packed_weight_m
         out[m] = ternary_dot_scalar_range(act, packed_weight_matrix + (size_t)m * stride, 0, K);
 }
 
+/* Scalar reference for either weight layout. */
+static inline void gemv_scalar_layout(const int8_t *act, const uint8_t *W, int32_t *out, int M, int K,
+                                      ternary_layout layout) {
+    const size_t stride = ternary_row_bytes(K, layout);
+    for (int m = 0; m < M; m++)
+        out[m] = layout == TERNARY_I128
+                     ? ternary_dot_i128_scalar_range(act, W + (size_t)m * stride, 0, K)
+                     : ternary_dot_scalar_range(act, W + (size_t)m * stride, 0, K);
+}
+
+/* ------------------------------------------------------------------------- */
+/* I128 layout micro-kernel: 4 rows x len weights (len: tile length; the     */
+/* tile starts on a 128-weight block boundary)                               */
+/* ------------------------------------------------------------------------- */
+
+#if defined(BITNET_NEON)
+static inline void ternary_dot4_i128_accumulate(const int8_t *act, const uint8_t *w, size_t stride,
+                                                int len, int32_t out[4]) {
+    const int8x16_t lut = vld1q_s8(k_ternary_lut);
+    const uint8x16_t m3 = vdupq_n_u8(3);
+    int32x4_t c[4] = {vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0)};
+    const int full = len & ~127;
+    for (int b = 0; b < full; b += 128) {
+        const int8_t *a = act + b;
+        int8x16_t av[8];
+        for (int i = 0; i < 8; i++) av[i] = vld1q_s8(a + 16 * i);
+        for (int r = 0; r < 4; r++) {
+            const uint8_t *wb = w + (size_t)r * stride + (b >> 2);
+            const uint8x16_t p0 = vld1q_u8(wb), p1 = vld1q_u8(wb + 16);
+            int32x4_t acc = c[r];
+            acc = TERNARY_DOT(acc, vqtbl1q_s8(lut, vandq_u8(p0, m3)), av[0]);
+            acc = TERNARY_DOT(acc, vqtbl1q_s8(lut, vandq_u8(p1, m3)), av[1]);
+            I128_NEON_FIELD(acc, p0, 1, av[2]);
+            I128_NEON_FIELD(acc, p1, 1, av[3]);
+            I128_NEON_FIELD(acc, p0, 2, av[4]);
+            I128_NEON_FIELD(acc, p1, 2, av[5]);
+            I128_NEON_FIELD(acc, p0, 3, av[6]);
+            I128_NEON_FIELD(acc, p1, 3, av[7]);
+            c[r] = acc;
+        }
+    }
+    for (int r = 0; r < 4; r++) {
+        out[r] += vaddvq_s32(c[r]);
+        if (full < len) out[r] += ternary_dot_i128_scalar_range(act, w + (size_t)r * stride, full, len);
+    }
+}
+#elif defined(BITNET_AVX2)
+static inline void ternary_dot4_i128_accumulate(const int8_t *act, const uint8_t *w, size_t stride,
+                                                int len, int32_t out[4]) {
+    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3), ones16 = _mm256_set1_epi16(1);
+    __m256i c0 = _mm256_setzero_si256(), c1 = c0, c2 = c0, c3 = c0, asum = c0;
+    const uint8_t *w0 = w, *w1 = w + stride, *w2 = w + 2 * stride, *w3 = w + 3 * stride;
+    const int full = len & ~127;
+    for (int b = 0; b < full; b += 128) {
+        const int8_t *a = act + b;
+        const int j = b >> 2;
+        /* sum(w*a) = sum((w+1)*a) - sum(a); sum(a) is shared by the 4 rows. */
+        asum = _mm256_add_epi32(asum, _mm256_madd_epi16(i128_block_asum16(a), ones16));
+        c0 = _mm256_add_epi32(c0, _mm256_madd_epi16(i128_block_u16(w0 + j, a, lut, m3), ones16));
+        c1 = _mm256_add_epi32(c1, _mm256_madd_epi16(i128_block_u16(w1 + j, a, lut, m3), ones16));
+        c2 = _mm256_add_epi32(c2, _mm256_madd_epi16(i128_block_u16(w2 + j, a, lut, m3), ones16));
+        c3 = _mm256_add_epi32(c3, _mm256_madd_epi16(i128_block_u16(w3 + j, a, lut, m3), ones16));
+    }
+    const int32_t as = hsum_epi32_avx2(asum);
+    out[0] += hsum_epi32_avx2(c0) - as;
+    out[1] += hsum_epi32_avx2(c1) - as;
+    out[2] += hsum_epi32_avx2(c2) - as;
+    out[3] += hsum_epi32_avx2(c3) - as;
+    if (full < len)
+        for (int r = 0; r < 4; r++) out[r] += ternary_dot_i128_scalar_range(act, w + (size_t)r * stride, full, len);
+}
+#else
+static inline void ternary_dot4_i128_accumulate(const int8_t *act, const uint8_t *w, size_t stride,
+                                                int len, int32_t out[4]) {
+    for (int r = 0; r < 4; r++) out[r] += ternary_dot_i128_scalar_range(act, w + (size_t)r * stride, 0, len);
+}
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Micro-kernel: 4 rows x len weights (NEON, AVX2, or scalar fallback)      */
 /* ------------------------------------------------------------------------- */
@@ -167,6 +245,7 @@ typedef struct {
     int            M;
     int            K;
     size_t         stride;
+    ternary_layout layout;
 } gemv_ctx;
 
 /* Computes rows [blk * GEMV_ROW_BLOCK, min(+GEMV_ROW_BLOCK, M)). */
@@ -184,25 +263,32 @@ static inline void gemv_row_block(void *ctx_, size_t blk) {
         const uint8_t *wtile = c->W + (size_t)(k0 >> 2);
 
         int r = r0;
-        for (; r + 4 <= r1; r += 4) {
-            ternary_dot4_accumulate(a, wtile + (size_t)r * stride, stride, len, acc + (r - r0));
+        if (c->layout == TERNARY_I128) {
+            for (; r + 4 <= r1; r += 4)
+                ternary_dot4_i128_accumulate(a, wtile + (size_t)r * stride, stride, len, acc + (r - r0));
+            for (; r < r1; r++)
+                acc[r - r0] += ternary_dot_i128(a, wtile + (size_t)r * stride, len);
+        } else {
+            for (; r + 4 <= r1; r += 4)
+                ternary_dot4_accumulate(a, wtile + (size_t)r * stride, stride, len, acc + (r - r0));
+            for (; r < r1; r++)
+                acc[r - r0] += ternary_dot_neon(a, wtile + (size_t)r * stride, len);
         }
-        for (; r < r1; r++)
-            acc[r - r0] += ternary_dot_neon(a, wtile + (size_t)r * stride, len);
     }
 
     memcpy(c->out + r0, acc, (size_t)(r1 - r0) * sizeof(int32_t));
 }
 
-static inline void gemv_neon_impl(const int8_t *act, const uint8_t *packed_weight_matrix,
-                                  int32_t *out, int M, int K, int allow_parallel) {
+static inline void gemv_neon_impl_layout(const int8_t *act, const uint8_t *packed_weight_matrix,
+                                         int32_t *out, int M, int K, int allow_parallel,
+                                         ternary_layout layout) {
     if (M <= 0) return;
     if (K <= 0) {
         memset(out, 0, (size_t)M * sizeof(int32_t));
         return;
     }
 
-    gemv_ctx ctx = {act, packed_weight_matrix, out, M, K, gemv_row_stride(K)};
+    gemv_ctx ctx = {act, packed_weight_matrix, out, M, K, ternary_row_bytes(K, layout), layout};
     const size_t nblk = ((size_t)M + GEMV_ROW_BLOCK - 1) / GEMV_ROW_BLOCK;
 
 #ifdef GEMV_USE_GCD
@@ -218,9 +304,20 @@ static inline void gemv_neon_impl(const int8_t *act, const uint8_t *packed_weigh
     }
 }
 
+static inline void gemv_neon_impl(const int8_t *act, const uint8_t *packed_weight_matrix,
+                                  int32_t *out, int M, int K, int allow_parallel) {
+    gemv_neon_impl_layout(act, packed_weight_matrix, out, M, K, allow_parallel, TERNARY_ROW4);
+}
+
 static inline void gemv_bitnet_neon(const int8_t *act, const uint8_t *packed_weight_matrix,
                                     int32_t *out, int M, int K) {
     gemv_neon_impl(act, packed_weight_matrix, out, M, K, 1);
+}
+
+/* SIMD GEMV for either layout (multi-threaded on macOS via GCD). */
+static inline void gemv_bitnet_layout(const int8_t *act, const uint8_t *W, int32_t *out, int M, int K,
+                                      ternary_layout layout, int allow_parallel) {
+    gemv_neon_impl_layout(act, W, out, M, K, allow_parallel, layout);
 }
 
 /* Single-threaded variant: isolates SIMD speedup from threading speedup. */

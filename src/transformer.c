@@ -385,8 +385,9 @@ static void bitlinear_multi(threadpool *pool, const int8_t *xq, float gamma, int
     m.first_blk[0] = 0;
     size_t off = 0;
     for (int i = 0; i < n; i++) {
+        const ternary_layout L = W[i]->dtype == BITNET_DTYPE_TERNARY_I128 ? TERNARY_I128 : TERNARY_ROW4;
         m.c[i] = (gemv_ctx){xq, (const uint8_t *)W[i]->data, yi + off, W[i]->rows, K,
-                            gemv_row_stride(K)};
+                            ternary_row_bytes(K, L), L};
         m.first_blk[i + 1] = m.first_blk[i] + ((size_t)W[i]->rows + GEMV_ROW_BLOCK - 1) / GEMV_ROW_BLOCK;
         off += (size_t)W[i]->rows;
     }

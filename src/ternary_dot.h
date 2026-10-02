@@ -20,6 +20,7 @@
 #ifndef BITNET_TERNARY_DOT_H
 #define BITNET_TERNARY_DOT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "simd.h"
@@ -169,5 +170,124 @@ static inline int32_t ternary_dot_neon(const int8_t *act, const uint8_t *packed_
 }
 
 #endif /* BITNET_NEON / BITNET_AVX2 */
+
+/* ========================================================================= */
+/* I128 layout (.bitnet v2): SIMD-friendly packing                           */
+/*                                                                           */
+/* Weights are grouped in blocks of 128 = 32 bytes. Within a block, byte j   */
+/* (0..31) field f (bits 2f..2f+1) holds weight 32f + j. One 32-byte load +  */
+/* shift/mask therefore yields 32 *consecutive* weights, matching 32         */
+/* consecutive activations: no de-interleaving and no per-byte replication.  */
+/* Codes are the same as ROW4 (00 = 0, 01 = +1, 10 = -1, 11 = 0). A row      */
+/* takes ceil(K / 128) * 32 bytes (the padding in the last block is zero).   */
+/* ========================================================================= */
+
+typedef enum {
+    TERNARY_ROW4 = 0, /* .bitnet v1: weight k at byte k/4, bits 2*(k%4) */
+    TERNARY_I128 = 1, /* .bitnet v2: see above */
+} ternary_layout;
+
+static inline size_t ternary_row_bytes(int K, ternary_layout layout) {
+    return layout == TERNARY_I128 ? (((size_t)K + 127) / 128) * 32 : ((size_t)K + 3) / 4;
+}
+
+/* Scalar reference over weights [begin, end) of an I128 row; begin must be a
+ * multiple of 128 for block alignment of later SIMD use, any value works here. */
+static inline int32_t ternary_dot_i128_scalar_range(const int8_t *act, const uint8_t *w, int begin,
+                                                    int end) {
+    int32_t sum = 0;
+    for (int k = begin; k < end; k++) {
+        const int r = k & 127;
+        const uint8_t code = (uint8_t)((w[(size_t)(k >> 7) * 32 + (r & 31)] >> (2 * (r >> 5))) & 3);
+        sum += (int32_t)act[k] * (int32_t)k_ternary_lut[code];
+    }
+    return sum;
+}
+
+#if defined(BITNET_NEON)
+
+/* acc += dot of one 128-weight block (16-byte halves; one table lookup per
+ * 16 codes; activations loaded contiguously). */
+#define I128_NEON_FIELD(acc, ph, f, a)                                                   \
+    acc = TERNARY_DOT(acc, vqtbl1q_s8(lut, (f) == 3 ? vshrq_n_u8(ph, 6)                  \
+                                                    : vandq_u8(vshrq_n_u8(ph, 2 * (f)), m3)), (a))
+
+static inline int32_t ternary_dot_i128(const int8_t *act, const uint8_t *w, int K) {
+    const int8x16_t lut = vld1q_s8(k_ternary_lut);
+    const uint8x16_t m3 = vdupq_n_u8(3);
+    int32x4_t c0 = vdupq_n_s32(0), c1 = c0, c2 = c0, c3 = c0;
+    const int full = K & ~127;
+    for (int b = 0; b < full; b += 128) {
+        const uint8x16_t p0 = vld1q_u8(w + (b >> 2)), p1 = vld1q_u8(w + (b >> 2) + 16);
+        const int8_t *a = act + b;
+        c0 = TERNARY_DOT(c0, vqtbl1q_s8(lut, vandq_u8(p0, m3)), vld1q_s8(a));
+        c1 = TERNARY_DOT(c1, vqtbl1q_s8(lut, vandq_u8(p1, m3)), vld1q_s8(a + 16));
+        I128_NEON_FIELD(c2, p0, 1, vld1q_s8(a + 32));
+        I128_NEON_FIELD(c3, p1, 1, vld1q_s8(a + 48));
+        I128_NEON_FIELD(c0, p0, 2, vld1q_s8(a + 64));
+        I128_NEON_FIELD(c1, p1, 2, vld1q_s8(a + 80));
+        I128_NEON_FIELD(c2, p0, 3, vld1q_s8(a + 96));
+        I128_NEON_FIELD(c3, p1, 3, vld1q_s8(a + 112));
+    }
+    int32_t sum = vaddvq_s32(vaddq_s32(vaddq_s32(c0, c1), vaddq_s32(c2, c3)));
+    if (full < K) sum += ternary_dot_i128_scalar_range(act, w, full, K);
+    return sum;
+}
+
+#elif defined(BITNET_AVX2)
+
+/* PSHUFB table: code -> w + 1 (unsigned for MADDUBS). */
+static inline __m256i i128_lut_u(void) {
+    return _mm256_setr_epi8(1, 2, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                            1, 2, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+}
+
+/* int16 pair sums of (w+1)*a over the 4 fields of one block. Each MADDUBS
+ * lane is in [-512, 508], so the 4-field sum stays inside int16. */
+static inline __m256i i128_block_u16(const uint8_t *wb, const int8_t *a, __m256i lut, __m256i m3) {
+    const __m256i p = _mm256_loadu_si256((const __m256i *)wb);
+    __m256i s = _mm256_maddubs_epi16(_mm256_shuffle_epi8(lut, _mm256_and_si256(p, m3)),
+                                     _mm256_loadu_si256((const __m256i *)a));
+    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(
+            _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 2), m3)),
+            _mm256_loadu_si256((const __m256i *)(a + 32))));
+    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(
+            _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 4), m3)),
+            _mm256_loadu_si256((const __m256i *)(a + 64))));
+    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(
+            _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 6), m3)),
+            _mm256_loadu_si256((const __m256i *)(a + 96))));
+    return s;
+}
+
+/* int16 pair sums of 1*a over one block (the -sum(a) correction). */
+static inline __m256i i128_block_asum16(const int8_t *a) {
+    const __m256i one = _mm256_set1_epi8(1);
+    __m256i s = _mm256_maddubs_epi16(one, _mm256_loadu_si256((const __m256i *)a));
+    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(one, _mm256_loadu_si256((const __m256i *)(a + 32))));
+    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(one, _mm256_loadu_si256((const __m256i *)(a + 64))));
+    return _mm256_add_epi16(s, _mm256_maddubs_epi16(one, _mm256_loadu_si256((const __m256i *)(a + 96))));
+}
+
+static inline int32_t ternary_dot_i128(const int8_t *act, const uint8_t *w, int K) {
+    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3), ones16 = _mm256_set1_epi16(1);
+    __m256i acc = _mm256_setzero_si256(), asum = _mm256_setzero_si256();
+    const int full = K & ~127;
+    for (int b = 0; b < full; b += 128) {
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(i128_block_u16(w + (b >> 2), act + b, lut, m3), ones16));
+        asum = _mm256_add_epi32(asum, _mm256_madd_epi16(i128_block_asum16(act + b), ones16));
+    }
+    int32_t sum = hsum_epi32_avx2(_mm256_sub_epi32(acc, asum)); /* sum((w+1)a) - sum(a) */
+    if (full < K) sum += ternary_dot_i128_scalar_range(act, w, full, K);
+    return sum;
+}
+
+#else
+
+static inline int32_t ternary_dot_i128(const int8_t *act, const uint8_t *w, int K) {
+    return ternary_dot_i128_scalar_range(act, w, 0, K);
+}
+
+#endif /* I128 kernels */
 
 #endif /* BITNET_TERNARY_DOT_H */

@@ -53,14 +53,15 @@ import zlib
 import numpy as np
 
 MAGIC = b"BITN"  # 0x42 0x49 0x54 0x4E
-VERSION = 1
+VERSION = 2          # written when any tensor uses the I128 layout; ROW4-only files stay v1
 HEADER_SIZE = 256
 ENTRY_SIZE = 96
 NAME_LEN = 48
 ALIGN = 64
 
-DT_F32, DT_F16, DT_TERNARY = 0, 1, 2
-DT_NAMES = {DT_F32: "f32", DT_F16: "f16", DT_TERNARY: "ternary"}
+DT_F32, DT_F16, DT_TERNARY, DT_TERNARY_I128 = 0, 1, 2, 3
+DT_NAMES = {DT_F32: "f32", DT_F16: "f16", DT_TERNARY: "ternary", DT_TERNARY_I128: "tern-i128"}
+TERNARY_DTYPES = (DT_TERNARY, DT_TERNARY_I128)
 
 FLAG_TIED_EMBEDDINGS = 1 << 0
 FLAG_SUB_NORMS = 1 << 1
@@ -149,6 +150,35 @@ def pack_microsoft_u8(q):
     for i in range(4):
         out |= ((q[i * r:(i + 1) * r] + 1).astype(np.uint8) << (2 * i))
     return out
+
+
+def pack_ternary_i128(q):
+    """int8 {-1,0,1} [M, K] -> I128 bytes [M, ceil(K/128)*32]: in each block of
+    128 weights, byte j field f (bits 2f..2f+1) holds weight 32f + j. Matches
+    src/ternary_dot.h (TERNARY_I128)."""
+    q = np.asarray(q, dtype=np.int8)
+    if q.ndim != 2:
+        die("ternary tensor must be 2-D")
+    if not np.all((q >= -1) & (q <= 1)):
+        die("ternary tensor has values outside {-1, 0, 1}")
+    m, k = q.shape
+    nb = (k + 127) // 128
+    codes = np.zeros((m, nb * 128), dtype=np.uint8)
+    codes[:, :k][q == 1] = 1
+    codes[:, :k][q == -1] = 2
+    c = codes.reshape(m, nb, 4, 32)                      # [row, block, field, j]
+    out = c[:, :, 0, :] | (c[:, :, 1, :] << 2) | (c[:, :, 2, :] << 4) | (c[:, :, 3, :] << 6)
+    return out.reshape(m, nb * 32).astype(np.uint8)
+
+
+def unpack_ternary_i128(packed, k):
+    """Inverse of pack_ternary_i128 (self-test only)."""
+    p = np.asarray(packed, dtype=np.uint8)
+    m = p.shape[0]
+    b = p.reshape(m, -1, 32)
+    fields = np.stack([(b >> (2 * f)) & 3 for f in range(4)], axis=2)  # [row, block, field, j]
+    lut = np.array([0, 1, -1, 0], dtype=np.int8)
+    return lut[fields.reshape(m, -1)][:, :k]
 
 
 def pack_ternary(q):
@@ -434,6 +464,8 @@ def tensor_nbytes(item):
     k = item["shape"][1] if len(item["shape"]) > 1 else 1
     if item["dtype"] == DT_TERNARY:
         return m * ((k + 3) // 4)
+    if item["dtype"] == DT_TERNARY_I128:
+        return m * (((k + 127) // 128) * 32)
     return m * k * (4 if item["dtype"] == DT_F32 else 2)
 
 
@@ -451,8 +483,14 @@ def ternary_values(src, item):
 # Writer
 # ---------------------------------------------------------------------------
 
-def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quiet=False):
+def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quiet=False,
+           layout="i128"):
     plan, flags = plan_tensors(src, cfg, embed_dtype)
+    if layout == "i128":
+        for it in plan:
+            if it["dtype"] == DT_TERNARY:
+                it["dtype"] = DT_TERNARY_I128
+    version = 2 if any(it["dtype"] == DT_TERNARY_I128 for it in plan) else 1
 
     table_off = HEADER_SIZE
     off = align_up(table_off + ENTRY_SIZE * len(plan))
@@ -469,15 +507,16 @@ def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quie
     ref_ternary, ref_embed = [], []
     tmp_path = out_path + ".tmp"
     t0 = time.time()
-    counts = {DT_F32: 0, DT_F16: 0, DT_TERNARY: 0}
+    counts = {DT_F32: 0, DT_F16: 0, DT_TERNARY: 0, DT_TERNARY_I128: 0}
     with open(tmp_path, "wb") as f:
         f.write(b"\0" * data_off)
         for n, item in enumerate(plan):
             f.seek(item["offset"])
             crc = 0
-            if item["dtype"] == DT_TERNARY:
+            if item["dtype"] in TERNARY_DTYPES:
                 q, beta = ternary_values(src, item)
-                payload = pack_ternary(q).tobytes()
+                packer = pack_ternary_i128 if item["dtype"] == DT_TERNARY_I128 else pack_ternary
+                payload = packer(q).tobytes()
                 crc = zlib.crc32(payload)
                 f.write(payload)
                 item["scale"] = beta
@@ -523,7 +562,7 @@ def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quie
                         it["offset"], it["nbytes"], it["scale"], it["crc"])
             for it in plan)
         header = bytearray(HEADER_SIZE)
-        struct.pack_into(HEADER_FMT, header, 0, MAGIC, VERSION, HEADER_SIZE, flags,
+        struct.pack_into(HEADER_FMT, header, 0, MAGIC, version, HEADER_SIZE, flags,
                          cfg["vocab_size"], cfg["dim"], cfg["hidden_dim"], cfg["n_layers"],
                          cfg["n_heads"], cfg["n_kv_heads"], cfg["max_seq_len"], cfg["ffn_act"],
                          cfg["norm_eps"], cfg["rope_theta"], len(plan), ENTRY_SIZE,
@@ -539,7 +578,8 @@ def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quie
 
     if not quiet:
         print(f"wrote {out_path}: {file_size / 2**20:.1f} MiB, {len(plan)} tensors "
-              f"({counts[DT_TERNARY]} ternary, {counts[DT_F32]} f32, {counts[DT_F16]} f16), "
+              f"v{version} ({counts[DT_TERNARY] + counts[DT_TERNARY_I128]} ternary "
+              f"[{'i128' if counts[DT_TERNARY_I128] else 'row4'}], {counts[DT_F32]} f32, {counts[DT_F16]} f16), "
               f"flags={'tied ' if flags & FLAG_TIED_EMBEDDINGS else ''}"
               f"{'sub_norms' if flags & FLAG_SUB_NORMS else ''}, {time.time() - t0:.1f}s",
               file=sys.stderr)
@@ -639,6 +679,7 @@ def self_test():
     for m, k in [(1, 1), (3, 5), (8, 64), (7, 691), (64, 2560)]:
         q = rng.integers(-1, 2, size=(m, k), dtype=np.int8)
         p = pack_ternary(q)
+        assert np.array_equal(unpack_ternary_i128(pack_ternary_i128(q), k), q)
         assert p.shape == (m, (k + 3) // 4)
         assert np.array_equal(unpack_ternary(p, k), q)
     # Bit layout spot-check against ternary_dot.h: weights [+1, -1, 0, +1] -> 0b01_00_10_01
@@ -668,6 +709,9 @@ def main(argv=None):
     ap.add_argument("--input", help="HF checkpoint directory or .safetensors file")
     ap.add_argument("--output", help="output .bitnet path")
     ap.add_argument("--ref", help="also write a verification sidecar for src/step4_loader.c")
+    ap.add_argument("--layout", choices=["i128", "row4"], default="i128",
+                    help="ternary weight layout: i128 (format v2, fast SIMD kernels; default) "
+                         "or row4 (format v1, readable by bitnet.c <= 1.1)")
     ap.add_argument("--embed-dtype", choices=["f16", "f32"], default="f16",
                     help="storage for embeddings / untied lm_head (default f16)")
     ap.add_argument("--max-seq-len", type=int, help="override max_position_embeddings")
@@ -699,10 +743,12 @@ def main(argv=None):
             make_mock_checkpoint(hf_dir, a.mock_flavor, a.dim, a.hidden_dim, a.n_layers,
                                  a.n_heads, a.n_kv_heads, a.vocab, a.max_seq_len or 256, a.seed)
             src, d = open_checkpoint(hf_dir)
-            export(src, read_config(d, a.max_seq_len), a.output, a.ref, a.embed_dtype, a.seed)
+            export(src, read_config(d, a.max_seq_len), a.output, a.ref, a.embed_dtype, a.seed,
+                   layout=a.layout)
     else:
         src, d = open_checkpoint(a.input)
-        export(src, read_config(d, a.max_seq_len), a.output, a.ref, a.embed_dtype, a.seed)
+        export(src, read_config(d, a.max_seq_len), a.output, a.ref, a.embed_dtype, a.seed,
+               layout=a.layout)
 
 
 if __name__ == "__main__":

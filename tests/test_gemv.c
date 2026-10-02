@@ -305,9 +305,116 @@ static void run_benchmark(int quick) {
     free(out);
 }
 
+/* ------------------------------------------------------------------------- */
+/* I128 layout (.bitnet v2)                                                  */
+/* ------------------------------------------------------------------------- */
+
+/* Re-encodes a ROW4 matrix into the I128 layout (same logical weights). */
+static void repack_i128(const uint8_t *row4, uint8_t *i128, int M, int K) {
+    const size_t s4 = ternary_row_bytes(K, TERNARY_ROW4), s128 = ternary_row_bytes(K, TERNARY_I128);
+    memset(i128, 0, (size_t)M * s128);
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < K; k++) {
+            const uint8_t code = (row4[(size_t)m * s4 + (k >> 2)] >> (2 * (k & 3))) & 3;
+            const int r = k & 127;
+            i128[(size_t)m * s128 + (size_t)(k >> 7) * 32 + (r & 31)] |= (uint8_t)(code << (2 * (r >> 5)));
+        }
+}
+
+static void run_i128_verification(void) {
+    static const struct { int M, K, trials; } shapes[] = {
+        {1, 1, 20}, {1, 127, 20}, {3, 128, 20}, {5, 129, 20}, {7, 255, 20}, {31, 256, 10},
+        {33, 640, 10}, {128, 512, 10}, {64, GEMV_K_TILE - 1, 5}, {64, GEMV_K_TILE + 1, 5},
+        {100, 3 * GEMV_K_TILE + 17, 3}, {2048, 4096, 2}, {4096, 4096, 2}, {640, 6912, 2},
+    };
+    enum { MAX_M = 4096, MAX_K = 3 * GEMV_K_TILE + 17 > 6912 ? 3 * GEMV_K_TILE + 17 : 6912 };
+    int8_t  *act = aligned_buf(MAX_K);
+    uint8_t *w4 = aligned_buf(matrix_bytes(MAX_M, MAX_K));
+    uint8_t *w128 = aligned_buf((size_t)MAX_M * ternary_row_bytes(MAX_K, TERNARY_I128));
+    int32_t *ref = aligned_buf(MAX_M * 4), *sc = aligned_buf(MAX_M * 4), *st = aligned_buf(MAX_M * 4),
+            *mt = aligned_buf(MAX_M * 4);
+    int cases = 0;
+    for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+        const int M = shapes[si].M, K = shapes[si].K;
+        for (int t = 0; t < shapes[si].trials; t++) {
+            fill_act_random(act, K);
+            if (t % 5 == 4) memset(act, -128, (size_t)K); /* extreme activations */
+            if (t % 7 == 6) {                              /* random bytes incl. reserved code 11 */
+                for (size_t i = 0; i < matrix_bytes(M, K); i++) w4[i] = (uint8_t)xorshift64();
+                for (int m = 0; m < M; m++) /* keep padding bits past K zero, like the exporter */
+                    for (int k = K; k < (int)(gemv_row_stride(K) * 4); k++)
+                        w4[(size_t)m * gemv_row_stride(K) + (k >> 2)] &= (uint8_t)~(3u << (2 * (k & 3)));
+            } else {
+                fill_weights_random(w4, M, K);
+            }
+            repack_i128(w4, w128, M, K);
+            gemv_scalar(act, w4, ref, M, K);                                 /* ROW4 reference */
+            gemv_scalar_layout(act, w128, sc, M, K, TERNARY_I128);
+            gemv_bitnet_layout(act, w128, st, M, K, TERNARY_I128, 0);
+            gemv_bitnet_layout(act, w128, mt, M, K, TERNARY_I128, 1);
+            for (int m = 0; m < M; m++) {
+                if (sc[m] != ref[m] || st[m] != ref[m] || mt[m] != ref[m])
+                    fprintf(stderr, "I128 MISMATCH M=%d K=%d row %d: ref %d scalar %d simd %d mt %d\n",
+                            M, K, m, ref[m], sc[m], st[m], mt[m]);
+                assert(sc[m] == ref[m] && st[m] == ref[m] && mt[m] == ref[m]);
+            }
+            cases++;
+        }
+    }
+    /* Single-row SIMD kernel incl. tails. */
+    for (int K = 1; K <= 700; K += 3) {
+        fill_act_random(act, K);
+        fill_weights_random(w4, 1, K);
+        repack_i128(w4, w128, 1, K);
+        assert(ternary_dot_i128(act, w128, K) == ternary_dot_scalar_range(act, w4, 0, K));
+        cases++;
+    }
+    free(act); free(w4); free(w128); free(ref); free(sc); free(st); free(mt);
+    printf("I128 layout:    PASSED (%d cases: scalar == SIMD-1T == SIMD-MT == ROW4 reference, "
+           "tails, -128 activations, reserved codes)\n", cases);
+}
+
+/* ROW4 vs I128 GEMV throughput on the same logical weights. */
+static void run_layout_benchmark(int quick) {
+    enum { M = 4096, K = 4096 };
+    int8_t *act = aligned_buf(K);
+    uint8_t *w4 = aligned_buf(matrix_bytes(M, K));
+    uint8_t *w128 = aligned_buf((size_t)M * ternary_row_bytes(K, TERNARY_I128));
+    int32_t *out = aligned_buf(M * sizeof(int32_t));
+    fill_act_random(act, K);
+    fill_weights_random(w4, M, K);
+    repack_i128(w4, w128, M, K);
+    const int calls = quick ? 20 : 400;
+    double best[2][2];
+    for (int L = 0; L < 2; L++)
+        for (int par = 0; par < 2; par++) {
+            const uint8_t *W = L ? w128 : w4;
+            const ternary_layout lay = L ? TERNARY_I128 : TERNARY_ROW4;
+            gemv_bitnet_layout(act, W, out, M, K, lay, par); /* warm-up */
+            double b = 1e30;
+            for (int i = 0; i < calls; i++) {
+                const uint64_t t0 = now_ns();
+                gemv_bitnet_layout(act, W, out, M, K, lay, par);
+                __asm__ volatile("" : : "r"(out) : "memory");
+                const double ms = (double)(now_ns() - t0) / 1e6;
+                b = ms < b ? ms : b;
+            }
+            best[L][par] = b;
+        }
+    printf("\nLayout benchmark: M=%d K=%d, best of %d calls (%s)\n", M, K, calls, TERNARY_DOT_PATH);
+    printf("  %-14s %12s %12s\n", "layout", "1 thread", "all threads");
+    printf("  %-14s %9.3f ms %9.3f ms\n", "ROW4 (v1)", best[0][0], best[0][1]);
+    printf("  %-14s %9.3f ms %9.3f ms\n", "I128 (v2)", best[1][0], best[1][1]);
+    printf("  I128 speedup:  %.2fx (1 thread), %.2fx (all threads)\n", best[0][0] / best[1][0],
+           best[0][1] / best[1][1]);
+    free(act); free(w4); free(w128); free(out);
+}
+
 int main(int argc, char **argv) {
     const int quick = argc > 1 && strcmp(argv[1], "--quick") == 0;
     run_verification();
+    run_i128_verification();
     run_benchmark(quick);
+    run_layout_benchmark(quick);
     return 0;
 }
