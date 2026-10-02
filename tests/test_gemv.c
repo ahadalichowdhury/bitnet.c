@@ -281,9 +281,15 @@ static void run_benchmark(int quick) {
 
     printf("\nBenchmark: M=%d, K=%d (%.1f MiB packed weights), median per call\n",
            M, K, (double)matrix_bytes(M, K) / (1 << 20));
+#ifdef GEMV_USE_GCD
     printf("  SIMD path: %s | row block %d | K tile %d | GCD over %d logical CPUs\n",
            TERNARY_DOT_PATH, GEMV_ROW_BLOCK, GEMV_K_TILE,
            (int)sysconf(_SC_NPROCESSORS_ONLN));
+#else
+    printf("  SIMD path: %s | row block %d | K tile %d | single-threaded (no GCD; the model\n"
+           "  uses its own thread pool, so 'multi-thread' == '1 thread' here)\n",
+           TERNARY_DOT_PATH, GEMV_ROW_BLOCK, GEMV_K_TILE);
+#endif
 
     for (int regime = 0; regime < 2; regime++) {
         const int nmat = regime == 0 ? 1 : nmat_cold;
@@ -296,8 +302,8 @@ static void run_benchmark(int quick) {
                : "cold: rotating matrices (weights streamed from DRAM)");
         printf("  %-22s %10s %10s %12s %10s\n", "kernel", "ms", "GOP/s", "W GB/s", "speedup");
         print_row("scalar",           t_sc, t_sc, M, K);
-        print_row("NEON 1 thread",    t_st, t_sc, M, K);
-        print_row("NEON multi-thread",t_mt, t_sc, M, K);
+        print_row("SIMD 1 thread",    t_st, t_sc, M, K);
+        print_row("SIMD multi-thread",t_mt, t_sc, M, K);
     }
 
     for (int i = 0; i < nmat_cold; i++) free(mats[i]);
