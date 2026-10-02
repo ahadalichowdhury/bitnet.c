@@ -281,7 +281,7 @@ static void run_benchmark(int quick) {
 
     printf("\nBenchmark: M=%d, K=%d (%.1f MiB packed weights), median per call\n",
            M, K, (double)matrix_bytes(M, K) / (1 << 20));
-    printf("  NEON path: %s | row block %d | K tile %d | GCD over %d logical CPUs\n",
+    printf("  SIMD path: %s | row block %d | K tile %d | GCD over %d logical CPUs\n",
            TERNARY_DOT_PATH, GEMV_ROW_BLOCK, GEMV_K_TILE,
            (int)sysconf(_SC_NPROCESSORS_ONLN));
 

@@ -213,7 +213,7 @@ static void run_benchmark(void) {
     printf("  %-8s %12.3f %14.1f %12.2f\n", "scalar", ms_scalar, ns_scalar, gops_scalar);
     printf("  %-8s %12.3f %14.1f %12.2f\n", "neon",   ms_neon,   ns_neon,   gops_neon);
     printf("  Speedup (scalar / neon): %.2fx\n", ms_scalar / ms_neon);
-    printf("  NEON path: %s\n", TERNARY_DOT_PATH);
+    printf("  SIMD path: %s\n", TERNARY_DOT_PATH);
     (void)sink;
 
     free(act);

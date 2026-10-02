@@ -16,6 +16,16 @@ jobs:
         run: make -j
       - name: Unit + mock-model tests (scalar fallbacks on x86-64)
         run: make test-mock
+      - name: AVX2 vs scalar bit-identity (mock model logits)
+        run: |
+          grep -m1 -o "AVX2 ([^)]*)" <(build/test_dot_product)          # the AVX2 path is the one running
+          make BUILD=build-scalar CFLAGS="-O3 -march=native -mavx2 -mfma -Wall -Wextra -std=c11 -DBITNET_FORCE_SCALAR" \
+               build-scalar/test_transformer build-scalar/test_dot_product
+          build-scalar/test_dot_product | grep -m1 "scalar (no SIMD)"
+          T=models/hf/bitnet-b1.58-2B-4T/tokenizer.json
+          build/test_transformer build/mock/mock.bitnet $T build/mock/mock.ref_logits --no-unit-tests --dump-logits avx2.f32 | grep "Logits dump"
+          build-scalar/test_transformer build/mock/mock.bitnet $T build/mock/mock.ref_logits --no-unit-tests --dump-logits scalar.f32 | grep "Logits dump"
+          cmp avx2.f32 scalar.f32 && echo "AVX2 and scalar logits are bit-identical ($(wc -c < avx2.f32) bytes)"
       - name: Shared library + Python bindings
         run: |
           make lib

@@ -66,7 +66,7 @@ static inline void gemv_scalar(const int8_t *act, const uint8_t *packed_weight_m
 }
 
 /* ------------------------------------------------------------------------- */
-/* Micro-kernel: 4 rows x len weights (NEON, or scalar fallback)            */
+/* Micro-kernel: 4 rows x len weights (NEON, AVX2, or scalar fallback)      */
 /* ------------------------------------------------------------------------- */
 
 /* out[r] += dot(row r) for 4 rows. `act` and `w` point at the same K offset
@@ -119,6 +119,35 @@ static inline void ternary_dot4_accumulate(const int8_t *act, const uint8_t *w, 
         sums = vaddq_s32(sums, vld1q_s32(tail));
     }
     vst1q_s32(out, vaddq_s32(vld1q_s32(out), sums));
+}
+#elif defined(BITNET_AVX2)
+/* AVX2: each 32-byte activation load and its maddubs(1, a) correction are
+ * shared by the 4 rows (see ternary_dot.h for the exact decode/MADDUBS trick). */
+static inline void ternary_dot4_accumulate(const int8_t *act, const uint8_t *w, size_t stride,
+                                           int len, int32_t out[4]) {
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const uint8_t *w0 = w, *w1 = w + stride, *w2 = w + 2 * stride, *w3 = w + 3 * stride;
+    __m256i c0 = _mm256_setzero_si256(), c1 = c0, c2 = c0, c3 = c0;
+    const int full = len & ~31;
+    for (int i = 0; i < full; i += 32) {
+        const __m256i a = _mm256_loadu_si256((const __m256i *)(act + i));
+        const __m256i asum = _mm256_maddubs_epi16(ones8, a);
+        const int j = i >> 2;
+        c0 = _mm256_add_epi32(c0, ternary_block32_avx2(ternary_decode32_u_avx2(w0 + j), a, asum));
+        c1 = _mm256_add_epi32(c1, ternary_block32_avx2(ternary_decode32_u_avx2(w1 + j), a, asum));
+        c2 = _mm256_add_epi32(c2, ternary_block32_avx2(ternary_decode32_u_avx2(w2 + j), a, asum));
+        c3 = _mm256_add_epi32(c3, ternary_block32_avx2(ternary_decode32_u_avx2(w3 + j), a, asum));
+    }
+    out[0] += hsum_epi32_avx2(c0);
+    out[1] += hsum_epi32_avx2(c1);
+    out[2] += hsum_epi32_avx2(c2);
+    out[3] += hsum_epi32_avx2(c3);
+    if (full < len) {
+        out[0] += ternary_dot_scalar_range(act, w0, full, len);
+        out[1] += ternary_dot_scalar_range(act, w1, full, len);
+        out[2] += ternary_dot_scalar_range(act, w2, full, len);
+        out[3] += ternary_dot_scalar_range(act, w3, full, len);
+    }
 }
 #else
 static inline void ternary_dot4_accumulate(const int8_t *act, const uint8_t *w, size_t stride,

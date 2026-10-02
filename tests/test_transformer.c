@@ -336,6 +336,10 @@ static int load_ref(const char *path, ref_data *r) {
     return 0;
 }
 
+/* --dump-logits FILE: raw float32 logits [T][V] of the reference run, used to
+ * compare SIMD and scalar builds bit-for-bit (e.g. AVX2 vs BITNET_FORCE_SCALAR). */
+static const char *g_dump_logits;
+
 static void verify_reference(const BitNetModel *m, const Tokenizer *tk, RunState *s, const ref_data *r) {
     const int V = m->config.vocab_size;
     assert(r->V == V);
@@ -396,6 +400,12 @@ static void verify_reference(const BitNetModel *m, const Tokenizer *tk, RunState
     assert(memcmp(first + (size_t)(r->T - 1) * V, s->logits, (size_t)V * 4) == 0);
     printf("KV cache:       PASSED (re-run bit-identical at all %d positions; rewind to pos %d and "
            "replay bit-identical)\n", r->T, r->T / 2);
+    if (g_dump_logits) {
+        FILE *f = fopen(g_dump_logits, "wb");
+        assert(f && fwrite(first, sizeof(float), (size_t)r->T * V, f) == (size_t)r->T * V);
+        fclose(f);
+        printf("Logits dump:    %d x %d float32 -> %s\n", r->T, V, g_dump_logits);
+    }
     free(first);
 }
 
@@ -488,6 +498,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--quick") == 0) quick = 1;
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--no-unit-tests") == 0) unit = 0;
+        else if (strcmp(argv[i], "--dump-logits") == 0 && i + 1 < argc) g_dump_logits = argv[++i];
         else if (!model_path) model_path = argv[i];
         else if (!tok_path) tok_path = argv[i];
         else ref_path = argv[i];
