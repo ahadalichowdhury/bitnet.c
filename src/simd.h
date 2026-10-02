@@ -42,6 +42,11 @@
 #define BITNET_DPBUSD(acc, u, s) _mm256_dpbusd_epi32((acc), (u), (s))
 #endif
 #endif
+/* AVX2 + FMA float kernels (attention, exp) whose float sums are ordered
+ * differently from the scalar code; gated like the F16C output layer. */
+#if defined(BITNET_F16C) && defined(__FMA__)
+#define BITNET_AVX2_FLOAT 1
+#endif
 #if defined(__FMA__)
 #define BITNET_FMADD(a, b, c) _mm256_fmadd_ps((a), (b), (c))
 #else

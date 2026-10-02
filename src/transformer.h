@@ -53,7 +53,7 @@ typedef struct {
     float   *xb;     /* [dim]          normed input / sub-layer output */
     float   *xb2;    /* [q_dim]        attention output (per head, concatenated) */
     float   *q;      /* [q_dim]        query for the current position */
-    float   *attn_part; /* [n_heads][max_chunks][head_dim + 2] split-softmax partials */
+    float   *attn_part; /* [TRANSFORMER_BATCH][n_heads][max_chunks][head_dim + 2] split-softmax partials */
     float   *hb;     /* [hidden_dim]   gate activations */
     float   *hb2;    /* [hidden_dim]   up activations */
     float   *logits; /* [vocab_size] */
