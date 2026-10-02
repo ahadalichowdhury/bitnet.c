@@ -59,8 +59,10 @@ ENTRY_SIZE = 96
 NAME_LEN = 48
 ALIGN = 64
 
-DT_F32, DT_F16, DT_TERNARY, DT_TERNARY_I128 = 0, 1, 2, 3
-DT_NAMES = {DT_F32: "f32", DT_F16: "f16", DT_TERNARY: "ternary", DT_TERNARY_I128: "tern-i128"}
+DT_F32, DT_F16, DT_TERNARY, DT_TERNARY_I128, DT_Q8 = 0, 1, 2, 3, 4
+DT_NAMES = {DT_F32: "f32", DT_F16: "f16", DT_TERNARY: "ternary", DT_TERNARY_I128: "tern-i128",
+            DT_Q8: "q8"}
+Q8_BLOCK = 32
 TERNARY_DTYPES = (DT_TERNARY, DT_TERNARY_I128)
 
 FLAG_TIED_EMBEDDINGS = 1 << 0
@@ -179,6 +181,25 @@ def unpack_ternary_i128(packed, k):
     fields = np.stack([(b >> (2 * f)) & 3 for f in range(4)], axis=2)  # [row, block, field, j]
     lut = np.array([0, 1, -1, 0], dtype=np.int8)
     return lut[fields.reshape(m, -1)][:, :k]
+
+
+def quantize_q8(w):
+    """float32 [M, K] (K % 32 == 0) -> (int8 quants [M, K], float32 scales [M, K/32]),
+    w ~= q * scale per block of 32 (src/q8.h). Round-half-to-even, clamp to +-127."""
+    m, k = w.shape
+    blocks = w.astype(np.float32).reshape(m, k // Q8_BLOCK, Q8_BLOCK)
+    amax = np.max(np.abs(blocks), axis=2)
+    scale = (amax / np.float32(127.0)).astype(np.float32)
+    with np.errstate(divide="ignore"):
+        inv = np.where(amax > 0, np.float32(127.0) / amax, np.float32(0.0)).astype(np.float32)
+    q = np.clip(np.rint(blocks * inv[:, :, None]), -127, 127).astype(np.int8)
+    return q.reshape(m, k), scale
+
+
+def dequantize_q8(q, scale):
+    m, k = q.shape
+    return (q.reshape(m, k // Q8_BLOCK, Q8_BLOCK).astype(np.float32)
+            * scale[:, :, None]).reshape(m, k)
 
 
 def pack_ternary(q):
@@ -375,7 +396,9 @@ def plan_tensors(src, cfg, embed_dtype):
     d, h, L = cfg["dim"], cfg["hidden_dim"], cfg["n_layers"]
     hd = d // cfg["n_heads"]
     q_out, kv_out = cfg["n_heads"] * hd, cfg["n_kv_heads"] * hd
-    edt = {"f16": DT_F16, "f32": DT_F32}[embed_dtype]
+    edt = {"f16": DT_F16, "f32": DT_F32, "q8": DT_Q8}[embed_dtype]
+    if edt == DT_Q8 and d % Q8_BLOCK:
+        die(f"--embed-dtype q8 needs dim % {Q8_BLOCK} == 0 (dim = {d}); use f16")
 
     def need(hf):
         if hf not in names:
@@ -466,6 +489,8 @@ def tensor_nbytes(item):
         return m * ((k + 3) // 4)
     if item["dtype"] == DT_TERNARY_I128:
         return m * (((k + 127) // 128) * 32)
+    if item["dtype"] == DT_Q8:
+        return m * k + m * (k // Q8_BLOCK) * 4
     return m * k * (4 if item["dtype"] == DT_F32 else 2)
 
 
@@ -483,14 +508,14 @@ def ternary_values(src, item):
 # Writer
 # ---------------------------------------------------------------------------
 
-def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quiet=False,
+def export(src, cfg, out_path, ref_path=None, embed_dtype="q8", seed=1234, quiet=False,
            layout="i128"):
     plan, flags = plan_tensors(src, cfg, embed_dtype)
     if layout == "i128":
         for it in plan:
             if it["dtype"] == DT_TERNARY:
                 it["dtype"] = DT_TERNARY_I128
-    version = 2 if any(it["dtype"] == DT_TERNARY_I128 for it in plan) else 1
+    version = 2 if any(it["dtype"] in (DT_TERNARY_I128, DT_Q8) for it in plan) else 1
 
     table_off = HEADER_SIZE
     off = align_up(table_off + ENTRY_SIZE * len(plan))
@@ -507,7 +532,7 @@ def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quie
     ref_ternary, ref_embed = [], []
     tmp_path = out_path + ".tmp"
     t0 = time.time()
-    counts = {DT_F32: 0, DT_F16: 0, DT_TERNARY: 0, DT_TERNARY_I128: 0}
+    counts = {DT_F32: 0, DT_F16: 0, DT_TERNARY: 0, DT_TERNARY_I128: 0, DT_Q8: 0}
     with open(tmp_path, "wb") as f:
         f.write(b"\0" * data_off)
         for n, item in enumerate(plan):
@@ -529,11 +554,26 @@ def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quie
                 arr = src.f32(item["hf"]) if src.dtype(item["hf"]) != "BF16" else None
                 rows = item["shape"][0]
                 step = max(1, (1 << 24) // max(1, item["nbytes"] // rows))  # ~16 MiB chunks
+                q8_scales = []  # Q8: quants are streamed, scales follow them in the payload
                 for r0 in range(0, rows, step):
                     if arr is None:  # BF16: convert chunk-wise to bound memory
                         chunk = bf16_bits_to_f32(src.raw(item["hf"])[r0:r0 + step])
                     else:
                         chunk = arr[r0:r0 + step]
+                    if item["dtype"] == DT_Q8:
+                        if not np.all(np.isfinite(chunk)):
+                            die(f"{item['hf']} contains NaN/Inf")
+                        q, sc = quantize_q8(chunk)
+                        q8_scales.append(sc)
+                        chunk = dequantize_q8(q, sc)  # what the engine sees (for --ref)
+                        b = q.tobytes()
+                        crc = zlib.crc32(b, crc)
+                        f.write(b)
+                        if ref_path and item["name"] == "tok_embeddings":
+                            for tok in sorted({0, rows // 2, rows - 1}):
+                                if r0 <= tok < r0 + step:
+                                    ref_embed.append((tok, chunk[tok - r0].astype(np.float32)))
+                        continue
                     if item["dtype"] == DT_F16:
                         if np.any(np.abs(chunk) > 65504.0):
                             die(f"{item['hf']} overflows float16; use --embed-dtype f32")
@@ -549,6 +589,10 @@ def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quie
                         for tok in sorted({0, rows // 2, rows - 1}):
                             if r0 <= tok < r0 + step:
                                 ref_embed.append((tok, chunk[tok - r0].astype(np.float32)))
+                if q8_scales:
+                    b = np.concatenate(q8_scales).astype("<f4").tobytes()
+                    crc = zlib.crc32(b, crc)
+                    f.write(b)
             item["crc"] = crc
             counts[item["dtype"]] += 1
             if not quiet and (n % 25 == 0 or n == len(plan) - 1):
@@ -579,7 +623,8 @@ def export(src, cfg, out_path, ref_path=None, embed_dtype="f16", seed=1234, quie
     if not quiet:
         print(f"wrote {out_path}: {file_size / 2**20:.1f} MiB, {len(plan)} tensors "
               f"v{version} ({counts[DT_TERNARY] + counts[DT_TERNARY_I128]} ternary "
-              f"[{'i128' if counts[DT_TERNARY_I128] else 'row4'}], {counts[DT_F32]} f32, {counts[DT_F16]} f16), "
+              f"[{'i128' if counts[DT_TERNARY_I128] else 'row4'}], {counts[DT_F32]} f32, {counts[DT_F16]} f16, "
+              f"{counts[DT_Q8]} q8), "
               f"flags={'tied ' if flags & FLAG_TIED_EMBEDDINGS else ''}"
               f"{'sub_norms' if flags & FLAG_SUB_NORMS else ''}, {time.time() - t0:.1f}s",
               file=sys.stderr)
@@ -696,6 +741,14 @@ def self_test():
     x = rng.normal(size=1000).astype(np.float32)
     y = bf16_bits_to_f32(f32_to_bf16_bits(x))
     assert np.max(np.abs(x - y) / np.abs(x)) <= 2 ** -8
+    # Q8: round trip within half a step per block; exact zeros; +-127 at the block max.
+    w = rng.normal(size=(5, 96)).astype(np.float32)
+    w[1, 32:64] = 0.0
+    q, sc = quantize_q8(w)
+    assert q.dtype == np.int8 and sc.shape == (5, 3) and np.all(np.abs(q) <= 127)
+    err = np.abs(dequantize_q8(q, sc) - w).reshape(5, 3, 32).max(axis=2)
+    assert np.all(err <= sc * 0.5 + 1e-7) and np.all(q[1, 32:64] == 0) and sc[1, 1] == 0
+    assert np.all(np.abs(q).reshape(5, 3, 32).max(axis=2)[sc > 0] == 127)
     print("export_bitnet self-test: PASSED")
 
 
@@ -712,8 +765,9 @@ def main(argv=None):
     ap.add_argument("--layout", choices=["i128", "row4"], default="i128",
                     help="ternary weight layout: i128 (format v2, fast SIMD kernels; default) "
                          "or row4 (format v1, readable by bitnet.c <= 1.1)")
-    ap.add_argument("--embed-dtype", choices=["f16", "f32"], default="f16",
-                    help="storage for embeddings / untied lm_head (default f16)")
+    ap.add_argument("--embed-dtype", choices=["q8", "f16", "f32"], default="q8",
+                    help="storage for embeddings / untied lm_head: q8 (int8 blocks of 32, "
+                         "1.125 bytes/weight, format v2; default), f16 or f32")
     ap.add_argument("--max-seq-len", type=int, help="override max_position_embeddings")
     ap.add_argument("--seed", type=int, default=1234, help="seed for --ref inputs and --mock")
     ap.add_argument("--self-test", action="store_true", help="run packing unit tests and exit")

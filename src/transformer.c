@@ -18,6 +18,7 @@
 #include "bitlinear.h"
 #include "gemv.h"
 #include "platform.h"
+#include "q8.h"
 #include "simd.h"
 
 #ifndef MAP_ANONYMOUS
@@ -356,6 +357,24 @@ static void f32_rows(void *ctx_, size_t blk) {
     const int r0 = (int)blk * F16_ROW_BLOCK;
     const int r1 = r0 + F16_ROW_BLOCK < c->M ? r0 + F16_ROW_BLOCK : c->M;
     for (int r = r0; r < r1; r++) c->out[r] = dot_f32(c->W + (size_t)r * c->K, c->x, c->K);
+}
+
+typedef struct {
+    const int8_t *W;   /* [M, K] quants */
+    const float  *ws;  /* [M, K/32] block scales */
+    const int8_t *xq;  /* [K] quantized input */
+    const float  *xs;  /* [K/32] input block scales */
+    float        *out;
+    int           M, K;
+} q8_ctx;
+
+static void q8_rows(void *ctx_, size_t blk) {
+    const q8_ctx *c = ctx_;
+    const int nb = c->K / Q8_BLOCK;
+    const int r0 = (int)blk * F16_ROW_BLOCK;
+    const int r1 = r0 + F16_ROW_BLOCK < c->M ? r0 + F16_ROW_BLOCK : c->M;
+    for (int r = r0; r < r1; r++)
+        c->out[r] = q8_dot(c->W + (size_t)r * c->K, c->ws + (size_t)r * nb, c->xq, c->xs, nb);
 }
 
 /* ========================================================================= */
@@ -730,7 +749,14 @@ void transformer_forward_ex(int token_id, int pos, const BitNetModel *m, RunStat
         return;
     }
     rmsnorm_neon(s->x, s->x, m->output_norm->data, dim, eps);
-    if (m->output->dtype == BITNET_DTYPE_F16) {
+    if (m->output->dtype == BITNET_DTYPE_Q8) {
+        /* x -> int8 blocks (xq is free after the last layer; xb holds the scales). */
+        q8_quantize(s->x, s->xq, s->xb, dim);
+        q8_ctx qc = {m->output->data, q8_scales(m->output->data, c->vocab_size, dim), s->xq,
+                     s->xb, s->logits, c->vocab_size, dim};
+        threadpool_run(s->pool, ((size_t)c->vocab_size + F16_ROW_BLOCK - 1) / F16_ROW_BLOCK, &qc,
+                       q8_rows);
+    } else if (m->output->dtype == BITNET_DTYPE_F16) {
         gemv_f16_neon(m->output->data, s->x, s->logits, c->vocab_size, dim, s->pool);
     } else {
         f32_ctx fc = {m->output->data, s->x, s->logits, c->vocab_size, dim};
