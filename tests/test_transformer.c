@@ -424,6 +424,86 @@ static void verify_reference(const BitNetModel *m, const Tokenizer *tk, RunState
 }
 
 /* ------------------------------------------------------------------------- */
+/* Batched prefill == token-by-token forward, bit for bit                     */
+/* ------------------------------------------------------------------------- */
+
+static void batch_check(const BitNetModel *m, RunState *s, int bench) {
+    const bitnet_config *c = &m->config;
+    const int V = c->vocab_size, kv_dim = c->n_kv_heads * c->head_dim;
+    enum { N = 45 };
+    int32_t toks[N];
+    uint64_t lcg = 12345;
+    for (int i = 0; i < N; i++) {
+        lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+        toks[i] = (int32_t)((lcg >> 33) % (uint64_t)V);
+    }
+    const size_t layer = (size_t)s->max_seq_len * kv_dim, span = (size_t)N * kv_dim;
+    float *kref = malloc((size_t)c->n_layers * span * 4), *vref = malloc((size_t)c->n_layers * span * 4);
+    float *lref = malloc((size_t)V * 4);
+    assert(kref && vref && lref);
+    for (int i = 0; i < N; i++) transformer_forward_ex(toks[i], i, m, s, i == N - 1);
+    memcpy(lref, s->logits, (size_t)V * 4);
+    for (int l = 0; l < c->n_layers; l++) {
+        memcpy(kref + l * span, s->key_cache + l * layer, span * 4);
+        memcpy(vref + l * span, s->value_cache + l * layer, span * 4);
+    }
+    /* Schedules: (first single tokens, then chunk sizes) covering ragged
+     * GEMM_TB groups, TRANSFORMER_BATCH splits and nonzero start positions. */
+    static const int sched[][8] = {
+        {N},                      /* 16 + 16 + 13 internally */
+        {1, 7, 37},
+        {2, 3, 5, 8, 9, 15, 3},
+        {16, 17, 12},
+        {1, 1, 1, 1, 1, 40},
+    };
+    const int nsched = (int)(sizeof(sched) / sizeof(sched[0]));
+    for (int k = 0; k < nsched; k++) {
+        for (int l = 0; l < c->n_layers; l++) { /* poison the cache span */
+            memset(s->key_cache + l * layer, 0xFF, span * 4);
+            memset(s->value_cache + l * layer, 0xFF, span * 4);
+        }
+        memset(s->logits, 0xFF, (size_t)V * 4);
+        int pos = 0;
+        for (int j = 0; j < 8 && pos < N; j++) {
+            const int n = sched[k][j];
+            transformer_forward_batch(toks + pos, n, pos, m, s, pos + n == N);
+            pos += n;
+        }
+        assert(pos == N);
+        assert(memcmp(lref, s->logits, (size_t)V * 4) == 0);
+        for (int l = 0; l < c->n_layers; l++) {
+            assert(memcmp(kref + l * span, s->key_cache + l * layer, span * 4) == 0);
+            assert(memcmp(vref + l * span, s->value_cache + l * layer, span * 4) == 0);
+        }
+    }
+    printf("Batched prefill: PASSED (%d schedules of %d tokens, chunks of 1..%d: KV cache of all %d "
+           "layers and final logits bit-identical to token-by-token)\n", nsched, N, TRANSFORMER_BATCH,
+           c->n_layers);
+    free(kref); free(vref); free(lref);
+
+    if (!bench) return;
+    enum { P = 256 };
+    int32_t prompt[P];
+    for (int i = 0; i < P; i++) {
+        lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+        prompt[i] = (int32_t)((lcg >> 33) % (uint64_t)V);
+    }
+    double ms[2] = {1e30, 1e30};
+    for (int rep = 0; rep < 2; rep++)
+        for (int v = 0; v < 2; v++) {
+            const uint64_t t0 = now_ns();
+            if (v == 0)
+                for (int i = 0; i < P; i++) transformer_forward_ex(prompt[i], i, m, s, i == P - 1);
+            else
+                transformer_forward_batch(prompt, P, 0, m, s, 1);
+            const double t = (double)(now_ns() - t0) / 1e6;
+            ms[v] = t < ms[v] ? t : ms[v];
+        }
+    printf("  prefill %d tokens: token-by-token %.0f ms (%.1f tok/s), batched %.0f ms (%.1f tok/s): %.2fx\n",
+           P, ms[0], P / ms[0] * 1e3, ms[1], P / ms[1] * 1e3, ms[0] / ms[1]);
+}
+
+/* ------------------------------------------------------------------------- */
 /* 5/6. Allocation check and benchmarks                                      */
 /* ------------------------------------------------------------------------- */
 
@@ -443,13 +523,16 @@ static void alloc_check(const BitNetModel *m, RunState *s, int token) {
     const long probe_seen = g_allocs;
     g_allocs = 0;
     for (int p = 0; p < 96; p++) transformer_forward(token, p, m, s); /* both attention paths */
+    int32_t batch[40];
+    for (int i = 0; i < 40; i++) batch[i] = token;
+    transformer_forward_batch(batch, 40, 0, m, s, 1); /* batched prefill (GEMM path) */
     const long n = g_allocs;
     hook_zones(0);
     if (probe_seen == 0) {
         printf("Allocations:    SKIPPED (allocator hooks not reached, e.g. under ASan)\n");
         return;
     }
-    printf("Allocations:    %s (%ld heap allocations during 96 forward passes, all threads; "
+    printf("Allocations:    %s (%ld heap allocations during 96 forward passes + a 40-token batched prefill, all threads; "
            "hook verified with a probe malloc)\n", n == 0 ? "PASSED" : "FAILED", n);
     assert(n == 0);
 #endif
@@ -585,6 +668,7 @@ int main(int argc, char **argv) {
         printf("Reference parity: SKIPPED (no reference logits file)\n");
     }
 
+    batch_check(&model, &s, real && !quick);
     alloc_check(&model, &s, bos);
     if (real) benchmark(&model, tk, &s, quick);
     printf("\n  resident memory: %.0f MiB (model pages touched + KV cache in use)\n",

@@ -451,16 +451,17 @@ int generate(const BitNetModel *m, const Tokenizer *tk, RunState *s, Sampler *sm
     for (int i = 0; i < n_prompt; i++) sampler_accept(smp, prompt[i]);
     const double t0 = now_ms();
 
-    /* Prefill: every prompt token goes through the KV cache; only the last
-     * one needs logits. */
-    for (int i = 0; i < n_prompt; i++) {
+    /* Prefill: every prompt token goes through the KV cache in batched chunks
+     * (one weight decode per several tokens); only the last one needs logits. */
+    for (int i = 0; i < n_prompt; i += TRANSFORMER_BATCH) {
         if (p->cancel && atomic_load_explicit(p->cancel, memory_order_relaxed)) {
             st->reason = GEN_STOP_CANCELLED;
             st->end_pos = start_pos + i;
             st->prefill_ms = st->total_ms = now_ms() - t0;
             return 0;
         }
-        transformer_forward_ex(prompt[i], start_pos + i, m, s, i == n_prompt - 1);
+        const int n = n_prompt - i < TRANSFORMER_BATCH ? n_prompt - i : TRANSFORMER_BATCH;
+        transformer_forward_batch(prompt + i, n, start_pos + i, m, s, i + n == n_prompt);
     }
     const double t_prefill = now_ms();
     st->prefill_ms = t_prefill - t0;

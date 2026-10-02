@@ -50,8 +50,8 @@ Apple M1 (8 GB, 4 performance + 4 efficiency cores, 8 threads), `bitnet-b1.58-2B
 |---|---|
 | Decode throughput | **~40 tokens/s** (40 tok/s at short context, 36 tok/s at ~500 tokens) |
 | Model load (mmap + validation) | **0.27 ms**, zero-copy (+0.03 MiB resident until weights are touched) |
-| Time to first token | ~0.4 s for a short chat prompt (warm) |
-| Prompt prefill | ~53 tokens/s |
+| Time to first token | ~0.15 s for a short chat prompt (warm) |
+| Prompt prefill | **~150 tokens/s** (batched, 16 tokens per weight pass) |
 | Model file | **851 MB** (ternary weights + int8 embeddings; 1125 MB with `--embed-dtype f16`) |
 | Heap allocations per token | **0** (measured on all threads during forward passes and `generate()`) |
 | Peak memory | **~930 MB** resident (851 MB memory-mapped weights + KV cache in use) |
@@ -89,6 +89,11 @@ pthreads: no BLAS, no C++, no Python at runtime.
   blocks (`I128`) so each shift + mask of a 32-byte load yields 32 consecutive
   weights, with no per-byte shuffles. Older v1 files still load;
   `./tools/download_model.sh` upgrades them automatically.
+- **Batched prefill.** Prompt tokens go through the model 16 at a time: each
+  128-weight block is decoded once and multiplied against 8 tokens' activations
+  (`ternary_gemm_i128` in `src/gemv.h`), which makes prefill ~3x faster than
+  token-by-token. Integer sums are exact, so the KV cache and logits are
+  bit-identical to the token-by-token path (tested).
 - **int8 output layer.** The tied embedding / output matrix (128256 x 2560, the
   largest tensor) is stored as int8 in blocks of 32 with a float scale each
   (`Q8`, `src/q8.h`): 1.125 bytes per weight instead of 2. The logits are exact
