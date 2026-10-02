@@ -4,9 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![C11](https://img.shields.io/badge/C-C11-blue.svg)](https://en.wikipedia.org/wiki/C11_(C_standard_revision))
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-ARM%20NEON-black.svg)](#architecture)
+[![x86-64](https://img.shields.io/badge/x86--64-AVX2-blue.svg)](#architecture)
 
 A dependency-free C11 inference engine for **BitNet b1.58** ternary models
-(`{-1, 0, +1}` weights), hand-tuned for Apple Silicon with ARM NEON. It runs
+(`{-1, 0, +1}` weights), hand-tuned for Apple Silicon with ARM NEON, with AVX2
+kernels for Intel/AMD x86-64. It runs
 [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
 at **~33 tokens/s on an M1**, with output matching an independent float64
 reference of the Hugging Face implementation.
@@ -75,6 +77,11 @@ pthreads: no BLAS, no C++, no Python at runtime.
   16-byte load is decoded into 64 weights with shifts, a mask and a single
   `TBL` lookup, then multiplied against int8 activations with the ARMv8.4
   `SDOT` instruction, four rows at a time (`src/ternary_dot.h`, `src/gemv.h`).
+- **AVX2 kernels (x86-64).** The same ternary dot product and 4-row GEMV in
+  256-bit form: one `PSHUFB` + two `AND`/`CMPEQ` masks decode 32 weights, and
+  `MADDUBS`/`MADD` accumulate exactly (`maddubs(w+1, a) - maddubs(1, a)`, which
+  stays correct for `a = -128` where `PSIGNB` would overflow). CI checks that
+  AVX2 and scalar builds produce bit-identical logits.
 - **BitLinear.** Activations are quantized per token to int8 (absmax,
   round-half-to-even, matching PyTorch) and the int32 result is rescaled once
   (`src/bitlinear.h`).
@@ -87,7 +94,7 @@ pthreads: no BLAS, no C++, no Python at runtime.
 - **Zero-allocation runtime.** All activations, the static KV cache and RoPE
   tables live in one pre-allocated arena; a custom pthread pool replaces GCD
   because `dispatch_apply` allocates on every call (`src/threadpool.c`).
-- **Portable.** Every NEON kernel has a scalar fallback (`src/simd.h`) and OS
+- **Portable.** Every SIMD kernel has a scalar fallback (`src/simd.h`) and OS
   specifics live in `src/platform.h`, so it also builds and passes its suites
   on Linux x86-64 (CI).
 
@@ -147,7 +154,7 @@ make bench              # ./bitnet --bench
 | Path | What |
 |---|---|
 | `include/bitnet.h` | public C API |
-| `src/ternary_dot.h`, `src/gemv.h` | NEON ternary dot product and multi-row GEMV |
+| `src/ternary_dot.h`, `src/gemv.h` | NEON / AVX2 ternary dot product and multi-row GEMV |
 | `src/bitlinear.h` | int8 activation quantization / dequantization |
 | `src/model_loader.[ch]` | zero-copy mmap loader for the validated `.bitnet` format |
 | `src/tokenizer.[ch]`, `src/unicode_tables.h` | Llama-3 byte-level BPE (Unicode 16 tables) |
@@ -158,7 +165,8 @@ make bench              # ./bitnet --bench
 | `tests/test_*.c` | per-module verification + benchmark suites |
 | `tools/` | model downloader, exporter, Python bindings, numpy reference, data generators |
 
-`-DBITNET_FORCE_SCALAR` and `-DBITNET_PORTABLE` force the scalar and non-Apple
+On x86-64 the Makefile adds `-mavx2 -mfma` (use `make X86_SIMD=` on CPUs without
+AVX2). `-DBITNET_FORCE_SCALAR` and `-DBITNET_PORTABLE` force the scalar and non-Apple
 code paths on a Mac for testing. See `ROADMAP.md` for the 8 build steps.
 
 ## License
