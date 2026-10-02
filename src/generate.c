@@ -71,7 +71,8 @@ int sampler_init(Sampler *s, int vocab, const SamplerConfig *cfg, char *err, siz
     s->probs = malloc((size_t)vocab * sizeof(float));
     s->idx = malloc((size_t)vocab * sizeof(int32_t));
     s->pairs = malloc((size_t)vocab * sizeof(prob_index));
-    if (!s->probs || !s->idx || !s->pairs) {
+    s->counts = calloc((size_t)vocab, sizeof(int32_t));
+    if (!s->probs || !s->idx || !s->pairs || !s->counts) {
         sampler_free(s);
         snprintf(err, err_len, "out of memory");
         return -1;
@@ -84,7 +85,45 @@ void sampler_free(Sampler *s) {
     free(s->probs);
     free(s->idx);
     free(s->pairs);
+    free(s->counts);
     memset(s, 0, sizeof(*s));
+}
+
+void sampler_reset_history(Sampler *s) {
+    s->hist_len = 0;
+    s->hist_head = 0;
+}
+
+void sampler_accept(Sampler *s, int32_t token) {
+    s->hist[s->hist_head] = token;
+    s->hist_head = (s->hist_head + 1) % SAMPLER_HISTORY;
+    if (s->hist_len < SAMPLER_HISTORY) s->hist_len++;
+}
+
+/* Applies repetition / frequency / presence penalties for the tokens in the
+ * last penalty_last_n accepted positions. counts[] is all zero on entry and
+ * restored to zero on exit, so this is O(window) with no allocation. */
+static void apply_penalties(Sampler *s, float *logits) {
+    const SamplerConfig *c = &s->cfg;
+    const int rep = c->repetition_penalty > 0.0f && c->repetition_penalty != 1.0f;
+    if (!rep && c->frequency_penalty == 0.0f && c->presence_penalty == 0.0f) return;
+    int n = c->penalty_last_n > 0 ? c->penalty_last_n : SAMPLER_DEFAULT_LAST_N;
+    if (n > s->hist_len) n = s->hist_len;
+    if (n > SAMPLER_HISTORY) n = SAMPLER_HISTORY;
+    const int start = (s->hist_head - n + SAMPLER_HISTORY) % SAMPLER_HISTORY;
+    for (int i = 0; i < n; i++) {
+        const int32_t t = s->hist[(start + i) % SAMPLER_HISTORY];
+        if (t >= 0 && t < s->vocab) s->counts[t]++;
+    }
+    for (int i = 0; i < n; i++) {
+        const int32_t t = s->hist[(start + i) % SAMPLER_HISTORY];
+        if (t < 0 || t >= s->vocab || s->counts[t] == 0) continue; /* already handled */
+        float l = logits[t];
+        if (rep) l = l > 0.0f ? l / c->repetition_penalty : l * c->repetition_penalty;
+        l -= c->frequency_penalty * (float)s->counts[t] + c->presence_penalty;
+        logits[t] = l;
+        s->counts[t] = 0; /* marks t done and restores the all-zero invariant */
+    }
 }
 
 static int32_t argmax(const float *x, int n) {
@@ -149,6 +188,7 @@ static int32_t draw(Sampler *s, const float *p, const int32_t *id, int n, double
 int32_t sampler_sample(Sampler *s, float *logits) {
     const int V = s->vocab;
     const SamplerConfig *c = &s->cfg;
+    apply_penalties(s, logits);
     if (c->temperature <= 0.0f) return argmax(logits, V);
 
     float *p = s->probs;
@@ -302,6 +342,88 @@ void utf8_stream_flush(Utf8Stream *u) {
 /* Generation loop                                                           */
 /* ========================================================================= */
 
+/* ========================================================================= */
+/* Stop strings                                                              */
+/* ========================================================================= */
+
+int stop_matcher_init(StopMatcher *m, const char *const *stops, int n_stops, Utf8Stream *out) {
+    memset(m, 0, sizeof(*m));
+    m->matched = -1;
+    m->out = out;
+    if (n_stops < 0 || n_stops > STOP_MAX_STRINGS || (n_stops > 0 && !stops)) return -1;
+    for (int i = 0; i < n_stops; i++) {
+        if (!stops[i]) return -1;
+        m->lens[i] = strlen(stops[i]);
+        if (m->lens[i] == 0 || m->lens[i] > STOP_MAX_LEN) return -1;
+    }
+    m->stops = stops;
+    m->n_stops = n_stops;
+    return 0;
+}
+
+/* Bytes of the held text that must stay held: the longest suffix of
+ * hold[0..n) that is a proper prefix of some stop string. */
+static size_t stop_suffix_keep(const StopMatcher *m, const char *buf, size_t n) {
+    size_t keep = 0;
+    for (int i = 0; i < m->n_stops; i++) {
+        const size_t max = m->lens[i] - 1 < n ? m->lens[i] - 1 : n;
+        for (size_t k = max; k > keep; k--)
+            if (memcmp(buf + n - k, m->stops[i], k) == 0) {
+                keep = k;
+                break;
+            }
+    }
+    return keep;
+}
+
+int stop_matcher_write(StopMatcher *m, const char *bytes, size_t len) {
+    if (m->matched >= 0) return 1;
+    if (m->n_stops == 0) {
+        utf8_stream_write(m->out, bytes, len);
+        return 0;
+    }
+    /* Work buffer = held bytes + new bytes, processed in bounded windows. */
+    char buf[2 * STOP_MAX_LEN + 256];
+    size_t i = 0;
+    while (i < len) {
+        const size_t room = sizeof(buf) - m->n_hold;
+        const size_t take = len - i < room ? len - i : room;
+        memcpy(buf, m->hold, m->n_hold);
+        memcpy(buf + m->n_hold, bytes + i, take);
+        const size_t n = m->n_hold + take;
+        i += take;
+
+        /* Earliest occurrence of any stop string. */
+        size_t best = n;
+        for (int s = 0; s < m->n_stops; s++) {
+            const size_t L = m->lens[s];
+            for (size_t p = 0; p + L <= n && p < best; p++)
+                if (memcmp(buf + p, m->stops[s], L) == 0) {
+                    if (p < best) {
+                        best = p;
+                        m->matched = s;
+                    }
+                    break;
+                }
+        }
+        if (m->matched >= 0) {
+            utf8_stream_write(m->out, buf, best);
+            m->n_hold = 0;
+            return 1;
+        }
+        const size_t keep = stop_suffix_keep(m, buf, n);
+        utf8_stream_write(m->out, buf, n - keep);
+        memcpy(m->hold, buf + n - keep, keep);
+        m->n_hold = keep;
+    }
+    return 0;
+}
+
+void stop_matcher_flush(StopMatcher *m) {
+    if (m->matched < 0 && m->n_hold) utf8_stream_write(m->out, m->hold, m->n_hold);
+    m->n_hold = 0;
+}
+
 static int is_stop(const GenerateParams *p, int32_t t) {
     for (int i = 0; i < p->n_stop; i++)
         if (p->stop_tokens[i] == t) return 1;
@@ -319,6 +441,14 @@ int generate(const BitNetModel *m, const Tokenizer *tk, RunState *s, Sampler *sm
 
     Utf8Stream us;
     utf8_stream_init(&us, p->on_text, p->user);
+    StopMatcher sm;
+    st->stop_string = -1;
+    if (stop_matcher_init(&sm, p->stop_strings, p->n_stop_strings, &us) != 0) return -1;
+    const int need_text = p->on_text || p->n_stop_strings > 0;
+
+    /* Penalties look back over this call's prompt plus what it generates. */
+    sampler_reset_history(smp);
+    for (int i = 0; i < n_prompt; i++) sampler_accept(smp, prompt[i]);
     const double t0 = now_ms();
 
     /* Prefill: every prompt token goes through the KV cache; only the last
@@ -351,14 +481,21 @@ int generate(const BitNetModel *m, const Tokenizer *tk, RunState *s, Sampler *sm
         if (p->out_tokens && st->n_generated < p->out_cap) p->out_tokens[st->n_generated] = tok;
         st->n_generated++;
         st->last_token = tok;
-        if (p->on_text && !tokenizer_is_special(tk, tok)) {
+        sampler_accept(smp, tok);
+        int hit = 0;
+        if (need_text && !tokenizer_is_special(tk, tok)) {
             size_t len;
             const char *bytes = bpe_decode_bytes(tk, tok, &len);
-            utf8_stream_write(&us, bytes, len);
+            hit = stop_matcher_write(&sm, bytes, len);
         }
         if (st->n_generated == 1) {
             t_first = now_ms();
             st->ttft_ms = t_first - t0;
+        }
+        if (hit) { /* like a stop token: the completing token is not fed */
+            st->reason = GEN_STOP_STRING;
+            st->stop_string = sm.matched;
+            break;
         }
         if (st->n_generated >= p->max_new_tokens) {
             st->reason = GEN_STOP_MAX_TOKENS;
@@ -375,6 +512,7 @@ int generate(const BitNetModel *m, const Tokenizer *tk, RunState *s, Sampler *sm
         transformer_forward(tok, pos, m, s);
         pos++;
     }
+    stop_matcher_flush(&sm);
     utf8_stream_flush(&us);
 
     const double t_end = now_ms();

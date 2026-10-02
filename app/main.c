@@ -88,6 +88,7 @@ static const char *reason_name(BitNetStopReason r) {
     case BITNET_STOP_CONTEXT_FULL: return "context full";
     case BITNET_STOP_CANCELLED:    return "cancelled";
     case BITNET_STOP_ERROR:        return "error";
+    case BITNET_STOP_STOP_STRING:  return "stop string";
     }
     return "?";
 }
@@ -121,7 +122,12 @@ static void usage(FILE *f) {
         "      --top-p P         nucleus sampling      (default 0.9)\n"
         "      --top-k K         top-k, 0 = off        (default 0)\n"
         "      --seed S          RNG seed, 0 = random  (default 0)\n"
-        "  -n, --max-new N       max tokens per reply  (default 512, 0 = until end of turn)\n\n"
+        "  -n, --max-new N       max tokens per reply  (default 512, 0 = until end of turn)\n"
+        "      --repeat-penalty R    repetition penalty, 1 = off (default 1.0; 1.1-1.3 curbs loops)\n"
+        "      --frequency-penalty F penalty per repeat, 0 = off (OpenAI semantics)\n"
+        "      --presence-penalty P  penalty for any repeat, 0 = off (OpenAI semantics)\n"
+        "      --repeat-last-n N     tokens the penalties look back over (default 64)\n"
+        "      --stop TEXT       stop before TEXT is generated (repeatable, up to 8)\n\n"
         "other:\n"
         "      --stats           print speed statistics after each reply (stderr)\n"
         "      --no-color        disable ANSI colors (also: NO_COLOR environment variable)\n"
@@ -269,7 +275,7 @@ static int run_bench(const char *model, const char *tokenizer, BitNetConfig cfg)
     bitnet_memory_info(ctx, &mem0);
     printf("%s\n\n", bitnet_model_description(ctx));
 
-    BitNetSampleParams greedy = {0.0f, 0, 1.0f, 1, 0};
+    BitNetSampleParams greedy = {.temperature = 0.0f, .top_p = 1.0f, .seed = 1};
     BitNetStats s;
 
     /* Cold: the first pass pages the memory-mapped weights in. */
@@ -308,7 +314,7 @@ static int run_bench(const char *model, const char *tokenizer, BitNetConfig cfg)
 
     /* Decode throughput: 128 tokens from a short prompt, and 64 tokens after
      * the long document (attention over ~550 positions). */
-    BitNetSampleParams dec = {0.6f, 0, 0.9f, 7, 128};
+    BitNetSampleParams dec = {.temperature = 0.6f, .top_p = 0.9f, .seed = 7, .max_new_tokens = 128};
     bitnet_generate(ctx, "Once upon a time, in a small village by the sea,", dec, ignore_token, NULL);
     BitNetStats decode_short;
     bitnet_last_stats(ctx, &decode_short);
@@ -351,7 +357,8 @@ int main(int argc, char **argv) {
     int interactive = 0, bench = 0, raw = 0, stats = 0, version = 0, no_color = 0;
 
     enum { O_MODEL = 256, O_TOK, O_SYSTEM, O_TEMP, O_TOPP, O_TOPK, O_SEED, O_THREADS, O_CTX, O_RAW,
-           O_BENCH, O_STATS, O_NOCOLOR };
+           O_BENCH, O_STATS, O_NOCOLOR, O_REPEAT, O_FREQ, O_PRES, O_LASTN, O_STOP };
+    static const char *stops[BITNET_MAX_STOP_STRINGS];
     static const struct option opts[] = {
         {"model", required_argument, NULL, O_MODEL},   {"tokenizer", required_argument, NULL, O_TOK},
         {"prompt", required_argument, NULL, 'p'},      {"interactive", no_argument, NULL, 'i'},
@@ -361,6 +368,11 @@ int main(int argc, char **argv) {
         {"ctx", required_argument, NULL, O_CTX},       {"max-new", required_argument, NULL, 'n'},
         {"raw", no_argument, NULL, O_RAW},             {"bench", no_argument, NULL, O_BENCH},
         {"stats", no_argument, NULL, O_STATS},         {"no-color", no_argument, NULL, O_NOCOLOR},
+        {"repeat-penalty", required_argument, NULL, O_REPEAT},
+        {"frequency-penalty", required_argument, NULL, O_FREQ},
+        {"presence-penalty", required_argument, NULL, O_PRES},
+        {"repeat-last-n", required_argument, NULL, O_LASTN},
+        {"stop", required_argument, NULL, O_STOP},
         {"version", no_argument, NULL, 'v'},           {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -401,6 +413,18 @@ int main(int argc, char **argv) {
         case O_BENCH:   bench = 1; break;
         case O_STATS:   stats = 1; break;
         case O_NOCOLOR: no_color = 1; break;
+        case O_REPEAT:  NUM(p.repetition_penalty, strtod, 0.01, 10, "--repeat-penalty"); break;
+        case O_FREQ:    NUM(p.frequency_penalty, strtod, -2, 2, "--frequency-penalty"); break;
+        case O_PRES:    NUM(p.presence_penalty, strtod, -2, 2, "--presence-penalty"); break;
+        case O_LASTN:   NUM(p.penalty_last_n, strtod, 1, 1024, "--repeat-last-n"); break;
+        case O_STOP:
+            if (p.n_stop == BITNET_MAX_STOP_STRINGS || !optarg[0] || strlen(optarg) > 64) {
+                fprintf(stderr, "bitnet: --stop takes up to 8 strings of 1-64 bytes\n");
+                return 2;
+            }
+            stops[p.n_stop++] = optarg;
+            p.stop = stops;
+            break;
         case 'v':       version = 1; break;
         case 'h':       usage(stdout); return 0;
         default:        usage(stderr); return 2;

@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
     assert(bitnet_last_error(ctx)[0] == '\0');
     printf("%s\n", bitnet_model_description(ctx));
     collect c;
-    const BitNetSampleParams greedy = {0.0f, 0, 1.0f, 1, 0};
+    const BitNetSampleParams greedy = {.temperature = 0.0f, .top_p = 1.0f, .seed = 1};
 
     /* ---- raw generation: greedy, deterministic */
     BitNetSampleParams p = greedy;
@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
     checks += 6;
 
     /* ---- seeds: explicit seed reproducible, seed 0 = fresh random seed */
-    BitNetSampleParams hot = {0.9f, 0, 0.95f, 1234, 24};
+    BitNetSampleParams hot = {.temperature = 0.9f, .top_p = 0.95f, .seed = 1234, .max_new_tokens = 24};
     char a[2048], b[2048];
     reset_collect(&c, ctx);
     bitnet_generate(ctx, "My favourite animal is", hot, on_piece, &c);
@@ -158,6 +158,47 @@ int main(int argc, char **argv) {
     assert(s1 != 0 && stats_of(ctx).seed != s1);
     (void)b;
     checks += 3;
+
+    /* ---- stop strings, penalties, and invalid stop configurations */
+    {
+        BitNetSampleParams sp = greedy;
+        const char *stops[] = {"."};
+        sp.stop = stops;
+        sp.n_stop = 1;
+        sp.max_new_tokens = 32;
+        reset_collect(&c, ctx);
+        bitnet_generate(ctx, "The capital of France is", sp, on_piece, &c);
+        s = stats_of(ctx);
+        assert(s.stop_reason == BITNET_STOP_STOP_STRING && strstr(c.text, "Paris") && !strchr(c.text, '.'));
+        printf("stop string:    \"The capital of France is%s\" [stop_string]\n", c.text);
+
+        sp.n_stop = 0;
+        sp.stop = NULL;
+        sp.repetition_penalty = 1.3f;
+        sp.frequency_penalty = 0.2f;
+        sp.presence_penalty = 0.1f;
+        sp.penalty_last_n = 128;
+        bitnet_generate(ctx, "The capital of France is", sp, NULL, NULL);
+        assert(stats_of(ctx).stop_reason != BITNET_STOP_ERROR);
+
+        char longs[80];
+        memset(longs, 'x', sizeof(longs) - 1);
+        longs[sizeof(longs) - 1] = '\0';
+        const char *bad_long[] = {longs};
+        const char *bad_empty[] = {""};
+        sp = greedy;
+        sp.stop = bad_long;
+        sp.n_stop = 1;
+        bitnet_generate(ctx, "x", sp, NULL, NULL);
+        assert(stats_of(ctx).stop_reason == BITNET_STOP_ERROR && strstr(bitnet_last_error(ctx), "1..64"));
+        sp.stop = bad_empty;
+        bitnet_chat_turn(ctx, "x", sp, NULL, NULL);
+        assert(stats_of(ctx).stop_reason == BITNET_STOP_ERROR);
+        sp.n_stop = 9;
+        bitnet_generate(ctx, "x", sp, NULL, NULL);
+        assert(stats_of(ctx).stop_reason == BITNET_STOP_ERROR && strstr(bitnet_last_error(ctx), "max 8"));
+        checks += 6;
+    }
 
     /* ---- multi-turn chat memory */
     p = greedy;

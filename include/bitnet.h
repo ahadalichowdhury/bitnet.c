@@ -50,12 +50,25 @@ typedef struct {
 } BitNetConfig;
 
 /* Per-call sampling parameters. */
+#define BITNET_MAX_STOP_STRINGS 8  /* each 1..64 bytes */
+
 typedef struct {
     float    temperature;    /* 0 = greedy */
     int      top_k;          /* 0 = disabled */
     float    top_p;          /* 1 = disabled */
     uint64_t seed;           /* 0 = pick a fresh random seed per call */
     int      max_new_tokens; /* 0 = until end of turn or end of context */
+    /* Penalties over the last penalty_last_n tokens of the prompt + reply:
+     *   repetition_penalty (HF semantics; 1 = off, 1.1-1.3 typical)
+     *   frequency_penalty / presence_penalty (OpenAI semantics; 0 = off) */
+    float    repetition_penalty;
+    float    frequency_penalty;
+    float    presence_penalty;
+    int      penalty_last_n;  /* 0 = 64; max 1024 */
+    /* Generation stops before any of these strings would be emitted (it is
+     * matched across token boundaries and never streamed). NULL/0 = none. */
+    const char *const *stop;
+    int      n_stop;          /* <= BITNET_MAX_STOP_STRINGS */
 } BitNetSampleParams;
 
 typedef void (*bitnet_token_fn)(const char *token, void *user_data);
@@ -66,6 +79,7 @@ typedef enum {
     BITNET_STOP_CONTEXT_FULL,
     BITNET_STOP_CANCELLED,       /* bitnet_cancel() */
     BITNET_STOP_ERROR,           /* see bitnet_last_error(ctx) */
+    BITNET_STOP_STOP_STRING,     /* reached one of params.stop (not emitted) */
 } BitNetStopReason;
 
 /* Statistics of the most recent bitnet_generate / bitnet_chat_turn. */

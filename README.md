@@ -37,8 +37,9 @@ More ways to run it:
 ```sh
 ./bitnet -i                        # interactive multi-turn chat (Ctrl+C stops a reply, Ctrl+D quits)
 ./bitnet -p "Explain RoPE briefly." --temp 0.7 --top-p 0.9 --stats
+./bitnet -p "List ten fruits." --repeat-penalty 1.2 --stop "\n\n"   # curb loops; stop at a blank line
 ./bitnet --bench                   # TTFT, prefill/decode tok/s, memory footprint
-./bitnet --help                    # all options: --temp --top-p --top-k --seed --threads --ctx --system --raw -n
+./bitnet --help                    # all options: sampling, penalties, --stop, --threads, --ctx, --system, --raw, -n
 ```
 
 ## Performance
@@ -134,6 +135,7 @@ with BitNet() as llm:
     for piece in llm.generate("The capital of France is", max_new_tokens=16):
         print(piece, end="", flush=True)        # streams as it is generated
     print(llm.chat("Name three primary colors."))  # multi-turn chat with history
+    print(llm.chat("Count to 10.", stop=["5"], repetition_penalty=1.1))
     print(llm.stats)                            # TTFT, tokens/s, stop reason, ...
 ```
 

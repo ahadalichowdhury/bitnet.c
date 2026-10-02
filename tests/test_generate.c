@@ -150,13 +150,13 @@ static void sampler_tests(int quick) {
     const int V = 8, N = quick ? 40000 : 200000;
     const float logits[8] = {2.0f, 1.0f, 0.5f, 3.0f, -1.0f, 0.0f, 2.5f, -3.0f};
     static const SamplerConfig cfgs[] = {
-        {1.0f, 0, 1.0f, 1},   /* plain softmax */
-        {0.5f, 0, 1.0f, 2},   /* sharper */
-        {2.0f, 0, 1.0f, 3},   /* flatter */
-        {1.0f, 3, 1.0f, 4},   /* top-k */
-        {0.7f, 0, 0.9f, 5},   /* nucleus */
-        {1.0f, 0, 0.5f, 6},   /* small nucleus */
-        {0.8f, 4, 0.8f, 7},   /* both */
+        {1.0f, 0, 1.0f, 1, 1.0f, 0.0f, 0.0f, 0},   /* plain softmax */
+        {0.5f, 0, 1.0f, 2, 1.0f, 0.0f, 0.0f, 0},   /* sharper */
+        {2.0f, 0, 1.0f, 3, 1.0f, 0.0f, 0.0f, 0},   /* flatter */
+        {1.0f, 3, 1.0f, 4, 1.0f, 0.0f, 0.0f, 0},   /* top-k */
+        {0.7f, 0, 0.9f, 5, 1.0f, 0.0f, 0.0f, 0},   /* nucleus */
+        {1.0f, 0, 0.5f, 6, 1.0f, 0.0f, 0.0f, 0},   /* small nucleus */
+        {0.8f, 4, 0.8f, 7, 1.0f, 0.0f, 0.0f, 0},   /* both */
     };
     double expect[8], worst = 0;
     for (size_t c = 0; c < sizeof(cfgs) / sizeof(cfgs[0]); c++) {
@@ -171,7 +171,7 @@ static void sampler_tests(int quick) {
     Sampler s;
     float buf[8];
     /* Greedy: argmax, ties -> lowest id; also temperature 0 ignores top-k/p. */
-    const SamplerConfig greedy = {0.0f, 2, 0.5f, 9};
+    const SamplerConfig greedy = {0.0f, 2, 0.5f, 9, 1.0f, 0.0f, 0.0f, 0};
     assert(sampler_init(&s, V, &greedy, err, sizeof(err)) == 0);
     memcpy(buf, logits, sizeof(buf));
     assert(sampler_sample(&s, buf) == 3);
@@ -180,7 +180,7 @@ static void sampler_tests(int quick) {
     assert(sampler_sample(&s, buf) == 1);
     sampler_free(&s);
     /* top-k with ties keeps the lowest ids; top_k=1 is deterministic. */
-    const SamplerConfig k1 = {1.0f, 1, 1.0f, 10};
+    const SamplerConfig k1 = {1.0f, 1, 1.0f, 10, 1.0f, 0.0f, 0.0f, 0};
     assert(sampler_init(&s, V, &k1, err, sizeof(err)) == 0);
     for (int i = 0; i < 100; i++) {
         memcpy(buf, ties, sizeof(buf));
@@ -190,7 +190,7 @@ static void sampler_tests(int quick) {
     /* Uniform logits: every token reachable. */
     const float flat[8] = {0};
     for (int i = 0; i < V; i++) expect[i] = 1.0 / V;
-    const SamplerConfig f = {1.0f, 0, 1.0f, 11};
+    const SamplerConfig f = {1.0f, 0, 1.0f, 11, 1.0f, 0.0f, 0.0f, 0};
     assert(sample_dist_err(&f, flat, V, expect, N) < tol);
 
     /* Full-vocab equivalence: the top-p prefilter + sort must pick exactly
@@ -198,7 +198,7 @@ static void sampler_tests(int quick) {
     const int BV = 128256, trials = quick ? 20 : 200;
     float *lg = xmalloc((size_t)BV * 4), *tmp = xmalloc((size_t)BV * 4), *p = xmalloc((size_t)BV * 4);
     int *ord = xmalloc((size_t)BV * sizeof(int));
-    const SamplerConfig big = {0.8f, 0, 0.9f, 1234};
+    const SamplerConfig big = {0.8f, 0, 0.9f, 1234, 1.0f, 0.0f, 0.0f, 0};
     assert(sampler_init(&s, BV, &big, err, sizeof(err)) == 0);
     uint64_t r = 99;
     double total_us = 0;
@@ -253,7 +253,7 @@ static void sampler_tests(int quick) {
 
     /* Reproducibility: same seed -> same stream; reseed restarts it. */
     Sampler a, b;
-    const SamplerConfig cr = {0.9f, 50, 0.95f, 777};
+    const SamplerConfig cr = {0.9f, 50, 0.95f, 777, 1.0f, 0.0f, 0.0f, 0};
     assert(sampler_init(&a, BV, &cr, err, sizeof(err)) == 0 && sampler_init(&b, BV, &cr, err, sizeof(err)) == 0);
     int32_t first[64];
     for (int i = 0; i < 64; i++) {
@@ -370,6 +370,168 @@ static void utf8_tests(void) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* 2b. Penalties and stop strings                                            */
+/* ------------------------------------------------------------------------- */
+
+static void penalty_tests(void) {
+    enum { V = 10 };
+    char err[64];
+    Sampler s;
+    const SamplerConfig cfg = {.temperature = 0.0f, .top_p = 1.0f, .repetition_penalty = 2.0f,
+                               .frequency_penalty = 0.5f, .presence_penalty = 0.25f, .penalty_last_n = 0};
+    assert(sampler_init(&s, V, &cfg, err, sizeof(err)) == 0);
+    const float base[V] = {1.0f, 2.0f, -1.0f, 4.0f, 0.5f, -2.0f, 0.0f, 3.0f, -0.5f, 1.5f};
+    float l[V];
+    int cases = 0;
+
+    /* History 1, 3, 3, 5: rep (HF) then -= freq*count + presence, once per token. */
+    sampler_reset_history(&s);
+    const int32_t hist[] = {1, 3, 3, 5};
+    for (int i = 0; i < 4; i++) sampler_accept(&s, hist[i]);
+    memcpy(l, base, sizeof(l));
+    (void)sampler_sample(&s, l);
+    float want[V];
+    memcpy(want, base, sizeof(want));
+    want[1] = 2.0f / 2.0f - 0.5f * 1 - 0.25f;
+    want[3] = 4.0f / 2.0f - 0.5f * 2 - 0.25f;
+    want[5] = -2.0f * 2.0f - 0.5f * 1 - 0.25f;
+    assert(memcmp(l, want, sizeof(l)) == 0);
+    for (int i = 0; i < V; i++) assert(s.counts[i] == 0); /* invariant restored */
+    cases++;
+
+    /* Greedy choice changes: 3 was the argmax (4.0) and is now 0.75 -> 7 wins. */
+    memcpy(l, base, sizeof(l));
+    assert(sampler_sample(&s, l) == 7);
+    sampler_reset_history(&s);
+    memcpy(l, base, sizeof(l));
+    assert(sampler_sample(&s, l) == 3); /* no history: untouched */
+    cases += 2;
+
+    /* Window: last_n = 2 sees only {3, 5} of 1, 3, 3, 5. */
+    s.cfg.penalty_last_n = 2;
+    for (int i = 0; i < 4; i++) sampler_accept(&s, hist[i]);
+    memcpy(l, base, sizeof(l));
+    (void)sampler_sample(&s, l);
+    assert(l[1] == base[1] && l[3] == 4.0f / 2.0f - 0.5f - 0.25f && l[5] == -4.0f - 0.5f - 0.25f);
+    cases++;
+
+    /* Ring buffer wrap: 3000 accepted tokens, window capped at SAMPLER_HISTORY. */
+    s.cfg.penalty_last_n = SAMPLER_HISTORY;
+    s.cfg.repetition_penalty = 1.0f; s.cfg.presence_penalty = 0.0f; s.cfg.frequency_penalty = 1.0f;
+    sampler_reset_history(&s);
+    for (int i = 0; i < 3000; i++) sampler_accept(&s, i < 2000 ? 0 : 9); /* last 1000 are 9 */
+    memcpy(l, base, sizeof(l));
+    (void)sampler_sample(&s, l);
+    assert(l[9] == base[9] - 1000.0f && l[0] == base[0] - (float)(SAMPLER_HISTORY - 1000));
+    for (int i = 0; i < V; i++) assert(s.counts[i] == 0);
+    cases++;
+
+    /* All penalties off: logits untouched. */
+    s.cfg.frequency_penalty = 0.0f;
+    memcpy(l, base, sizeof(l));
+    (void)sampler_sample(&s, l);
+    assert(memcmp(l, base, sizeof(l)) == 0);
+    cases++;
+    sampler_free(&s);
+    printf("Penalties:      PASSED (%d cases: HF repetition + OpenAI frequency/presence exact, greedy "
+           "choice changes, window, 3000-token ring wrap, count table restored)\n", cases);
+}
+
+typedef struct {
+    char   text[256];
+    size_t n;
+} sbuf;
+
+static void sbuf_sink(void *user, const char *p, size_t n) {
+    sbuf *b = user;
+    assert(b->n + n < sizeof(b->text));
+    memcpy(b->text + b->n, p, n);
+    b->n += n;
+    b->text[b->n] = '\0';
+}
+
+/* Streams `text` in chunks given by cut positions; returns 1 if a stop matched. */
+static int run_stops(const char *text, const char *const *stops, int n_stops, const size_t *cuts,
+                     int ncuts, sbuf *out, int *which) {
+    Utf8Stream u;
+    StopMatcher m;
+    memset(out, 0, sizeof(*out));
+    utf8_stream_init(&u, sbuf_sink, out);
+    assert(stop_matcher_init(&m, stops, n_stops, &u) == 0);
+    const size_t len = strlen(text);
+    size_t prev = 0;
+    int hit = 0;
+    for (int i = 0; i <= ncuts && !hit; i++) {
+        const size_t end = i < ncuts ? cuts[i] : len;
+        hit = stop_matcher_write(&m, text + prev, end - prev);
+        prev = end;
+    }
+    if (!hit) stop_matcher_flush(&m);
+    utf8_stream_flush(&u);
+    *which = m.matched;
+    return hit;
+}
+
+static void stop_tests(void) {
+    static const struct {
+        const char *text;
+        const char *stops[3];
+        int         n;
+        const char *want;
+        int         which; /* -1: no match */
+    } cases[] = {
+        {"Hello world. The end.", {"."}, 1, "Hello world", 0},
+        {"Hello world. The end.", {"world", "Hello"}, 2, "", 1},          /* earliest match wins */
+        {"Hello world. The end.", {"xyz"}, 1, "Hello world. The end.", -1},
+        {"aaab", {"aab"}, 1, "a", 0},                                      /* overlapping prefix */
+        {"User: hi\nAssistant: ok\nUser: next", {"\nUser:"}, 1, "User: hi\nAssistant: ok", 0},
+        {"abcab", {"abd"}, 1, "abcab", -1},                                /* held prefix released */
+        {"a\xf0\x9f\x8c\xbc" "b", {"\xf0\x9f\x8c\xbc"}, 1, "a", 0},        /* emoji stop string */
+        {"caf\xc3\xa9 ok", {"ok"}, 1, "caf\xc3\xa9 ", 0},                  /* UTF-8 before stop */
+    };
+    int n = 0;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const size_t len = strlen(cases[c].text);
+        for (int mode = 0; mode < 202; mode++) {
+            size_t cuts[64];
+            int nc = 0;
+            if (mode == 1) for (size_t i = 1; i < len && nc < 64; i++) cuts[nc++] = i;
+            else if (mode > 1) {
+                uint64_t r = (uint64_t)(mode * 2654435761u + c);
+                for (size_t i = 1; i < len && nc < 64; i++) {
+                    r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+                    if (r % 3 == 0) cuts[nc++] = i;
+                }
+            }
+            sbuf out;
+            int which;
+            const int hit = run_stops(cases[c].text, cases[c].stops, cases[c].n, cuts, nc, &out, &which);
+            if (strcmp(out.text, cases[c].want) != 0 || hit != (cases[c].which >= 0) || which != cases[c].which)
+                fprintf(stderr, "stop case %zu mode %d: got '%s' (hit %d which %d)\n", c, mode, out.text, hit, which);
+            assert(strcmp(out.text, cases[c].want) == 0);
+            assert(hit == (cases[c].which >= 0) && which == cases[c].which);
+            n++;
+        }
+    }
+    /* Invalid configurations are rejected. */
+    StopMatcher m;
+    Utf8Stream u;
+    utf8_stream_init(&u, NULL, NULL);
+    const char *empty[] = {""};
+    char longs[STOP_MAX_LEN + 2];
+    memset(longs, 'x', sizeof(longs) - 1);
+    longs[sizeof(longs) - 1] = '\0';
+    const char *too_long[] = {longs};
+    const char *nine[9] = {"a", "b", "c", "d", "e", "f", "g", "h", "i"};
+    assert(stop_matcher_init(&m, empty, 1, &u) == -1);
+    assert(stop_matcher_init(&m, too_long, 1, &u) == -1);
+    assert(stop_matcher_init(&m, nine, 9, &u) == -1);
+    assert(stop_matcher_init(&m, NULL, 0, &u) == 0);
+    printf("Stop strings:   PASSED (%d runs: 8 cases x 202 chunkings incl. byte-by-byte, overlapping "
+           "prefixes, emoji / UTF-8; invalid stops rejected)\n", n + 4);
+}
+
+/* ------------------------------------------------------------------------- */
 /* 3. Generation on the real model                                           */
 /* ------------------------------------------------------------------------- */
 
@@ -398,7 +560,7 @@ static GenerateStats run(ctx_t *c, const char *title, const char *lead, const in
     Sampler smp;
     char err[64];
     assert(sampler_init(&smp, c->m->config.vocab_size, sc, err, sizeof(err)) == 0);
-    GenerateParams gp = {max_new, c->stop, 2, capture_sink, cap, out, max_new, NULL};
+    GenerateParams gp = {max_new, c->stop, 2, capture_sink, cap, out, max_new, NULL, NULL, 0};
     cap->echo = echo;
     if (echo && title) printf("\n--- %s\n%s", title, lead ? lead : "");
     GenerateStats st;
@@ -419,7 +581,7 @@ static void model_tests(ctx_t *c, int quick) {
     enum { CAP = 4096 };
     int32_t prompt[CAP], out1[512], out2[512];
     char *text1 = xmalloc(65536), *text2 = xmalloc(65536);
-    const SamplerConfig greedy = {0.0f, 0, 1.0f, 0};
+    const SamplerConfig greedy = {0.0f, 0, 1.0f, 0, 1.0f, 0.0f, 0.0f, 0};
     const int n_raw = encode_raw(c->tk, "The capital of France is", prompt, CAP);
     const int gen_n = quick ? 12 : 48;
 
@@ -456,7 +618,7 @@ static void model_tests(ctx_t *c, int quick) {
 
     /* C. Creative sampling (temp 0.7, top-p 0.9): same seed reproduces the
      *    exact text; another seed diverges. */
-    const SamplerConfig creative = {0.7f, 0, 0.9f, 42};
+    const SamplerConfig creative = {0.7f, 0, 0.9f, 42, 1.0f, 0.0f, 0.0f, 0};
     n = build_chat_prompt(c->tk, DEFAULT_SYSTEM, "Write a short poem about the ocean.", 1, prompt, CAP);
     cap = (capture){text1, 0, 65536, 1, 0, 0};
     GenerateStats cr = run(c, "creative chat (temp 0.7, top-p 0.9, seed 42)",
@@ -497,15 +659,77 @@ static void model_tests(ctx_t *c, int quick) {
     printf("  -> %d of %d tokens were partial UTF-8 fragments; %d chunks streamed, all complete valid "
            "UTF-8, bytes identical to the decoded tokens\n", partial, d.n_generated, cap.chunks);
 
-#ifdef ALLOC_HOOK_AVAILABLE
-    /* E. The whole generate() call (prefill, sampling, streaming) allocates
-     *    nothing once the sampler exists. */
+    /* F. Stop string: generation ends before "." is produced, nothing of it is
+     *    streamed, and the completing token is not fed. */
     {
         Sampler smp;
         char err[64];
-        assert(sampler_init(&smp, c->m->config.vocab_size, &creative, err, sizeof(err)) == 0);
+        assert(sampler_init(&smp, c->m->config.vocab_size, &greedy, err, sizeof(err)) == 0);
+        const char *stops[] = {"."};
+        capture sc = {text2, 0, 65536, 1, 0, 0};
+        const GenerateParams gp = {.max_new_tokens = 32, .stop_tokens = c->stop, .n_stop = 2,
+                                   .on_text = capture_sink, .user = &sc, .out_tokens = out2, .out_cap = 32,
+                                   .stop_strings = stops, .n_stop_strings = 1};
+        printf("\n--- stop string \".\" (greedy)\nThe capital of France is");
+        const int nr = encode_raw(c->tk, "The capital of France is", prompt, CAP); /* D reused prompt[] */
+        GenerateStats st;
+        assert(generate(c->m, c->tk, c->s, &smp, prompt, nr, 0, &gp, &st) == 0);
+        printf("\n");
+        sampler_free(&smp);
+        text2[sc.n] = '\0';
+        assert(st.reason == GEN_STOP_STRING && st.stop_string == 0 && !strchr(text2, '.'));
+        assert(strstr(text2, "Paris"));
+        assert(st.end_pos == nr + st.n_generated - 1); /* completing token not fed */
+        printf("  -> stopped by stop string after %d tokens; '.' never streamed\n", st.n_generated);
+    }
+
+    /* G. Repetition penalty breaks the greedy emoji loop seen above. */
+    {
+        int counts_max[2];
+        for (int pen = 0; pen < 2; pen++) {
+            SamplerConfig cfg = greedy;
+            cfg.repetition_penalty = pen ? 1.3f : 1.0f;
+            Sampler smp;
+            char err[64];
+            assert(sampler_init(&smp, c->m->config.vocab_size, &cfg, err, sizeof(err)) == 0);
+            n = build_chat_prompt(c->tk, DEFAULT_SYSTEM,
+                                  "Reply with five emoji that describe a happy summer day, then the word done.",
+                                  1, prompt, CAP);
+            capture pc = {text2, 0, 65536, 1, 0, 0};
+            const GenerateParams gp = {.max_new_tokens = 48, .stop_tokens = c->stop, .n_stop = 2,
+                                       .on_text = capture_sink, .user = &pc, .out_tokens = out2, .out_cap = 48};
+            printf("\n--- emoji, greedy, repetition penalty %.1f\nAssistant: ", cfg.repetition_penalty);
+            GenerateStats st;
+            assert(generate(c->m, c->tk, c->s, &smp, prompt, n, 0, &gp, &st) == 0);
+            printf("\n");
+            sampler_free(&smp);
+            int best = 0;
+            for (int i = 0; i < st.n_generated; i++) {
+                int k = 0;
+                for (int j = 0; j < st.n_generated; j++) k += out2[j] == out2[i];
+                best = k > best ? k : best;
+            }
+            counts_max[pen] = best;
+        }
+        printf("  -> most repeated token: %d times without penalty, %d with 1.3\n", counts_max[0], counts_max[1]);
+        assert(counts_max[1] < counts_max[0]);
+    }
+
+#ifdef ALLOC_HOOK_AVAILABLE
+    /* E. The whole generate() call (prefill, sampling with all penalties,
+     *    stop-string matching, streaming) allocates nothing once the sampler
+     *    exists. */
+    {
+        Sampler smp;
+        char err[64];
+        SamplerConfig pc = creative;
+        pc.repetition_penalty = 1.1f;
+        pc.frequency_penalty = 0.2f;
+        pc.presence_penalty = 0.1f;
+        assert(sampler_init(&smp, c->m->config.vocab_size, &pc, err, sizeof(err)) == 0);
         capture quiet = {text2, 0, 65536, 0, 0, 0};
-        GenerateParams gp = {32, c->stop, 2, capture_sink, &quiet, out2, 32, NULL};
+        const char *stops[] = {"zzq#", "\nUser:"};
+        GenerateParams gp = {32, c->stop, 2, capture_sink, &quiet, out2, 32, NULL, stops, 2};
         GenerateStats st;
         assert(hook_zones(1) == 0);
         void *volatile probe = malloc(16);
@@ -518,7 +742,7 @@ static void model_tests(ctx_t *c, int quick) {
         sampler_free(&smp);
         assert(probe_seen > 0 && allocs == 0);
         printf("\nAllocations:    PASSED (0 heap allocations in generate(): %d-token prefill + %d sampled "
-               "tokens + streaming, all threads)\n", st.n_prompt, st.n_generated);
+               "tokens with penalties + stop strings + streaming, all threads)\n", st.n_prompt, st.n_generated);
     }
 #else
     printf("\nAllocations:    SKIPPED (allocation hook unavailable on this build/platform)\n");
@@ -543,7 +767,7 @@ static void benchmark(ctx_t *c, int quick) {
     }
     buf[bl] = '\0';
     const int n = build_chat_prompt(c->tk, DEFAULT_SYSTEM, buf, 1, prompt, CAP);
-    const SamplerConfig sc = {0.6f, 0, 0.9f, 7}; /* model card defaults */
+    const SamplerConfig sc = {0.6f, 0, 0.9f, 7, 1.0f, 0.0f, 0.0f, 0}; /* model card defaults */
     capture cap = {NULL, 0, 0, 0, 0, 0};
     const int max_new = quick ? 16 : 128;
     GenerateStats st = run(c, NULL, NULL, prompt, n, &sc, max_new, 0, out, &cap);
@@ -608,7 +832,7 @@ static void interactive(ctx_t *c, const SamplerConfig *sc, const char *system, i
             n = build_chat_prompt(c->tk, system, line, 1, prompt, CAP);
         }
         capture cap = {NULL, 0, 0, 1, 0, 0};
-        GenerateParams gp = {max_new, c->stop, 2, capture_sink, &cap, out, max_new, NULL};
+        GenerateParams gp = {max_new, c->stop, 2, capture_sink, &cap, out, max_new, NULL, NULL, 0};
         assert(generate(c->m, c->tk, c->s, &smp, prompt, n, pos, &gp, &last) == 0);
         pos = last.end_pos;
         printf("\n  [prefill %d tok @ %.1f tok/s | TTFT %.0f ms | %d tok @ %.1f tok/s | context %d/%d]\n",
@@ -627,7 +851,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     const char *model_path = NULL, *tok_path = NULL, *prompt_text = NULL, *system = DEFAULT_SYSTEM;
     int quick = 0, chat = 0, inter = 0, max_new = 256, threads = 0, unit_only = 0;
-    SamplerConfig sc = {0.6f, 0, 0.9f, (uint64_t)time(NULL)};
+    SamplerConfig sc = {0.6f, 0, 0.9f, (uint64_t)time(NULL), 1.0f, 0.0f, 0.0f, 0};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const int more = i + 1 < argc;
@@ -661,6 +885,8 @@ int main(int argc, char **argv) {
     if (test_mode || unit_only) {
         sampler_tests(quick);
         utf8_tests();
+        penalty_tests();
+        stop_tests();
         if (unit_only) return 0; /* model-free suites only (CI) */
     }
 
@@ -705,7 +931,7 @@ int main(int argc, char **argv) {
         assert(n > 0 && n <= 8192);
         if (!chat) printf("%s", prompt_text);
         capture cap = {NULL, 0, 0, 1, 0, 0};
-        GenerateParams gp = {max_new, c.stop, 2, capture_sink, &cap, out, max_new, NULL};
+        GenerateParams gp = {max_new, c.stop, 2, capture_sink, &cap, out, max_new, NULL, NULL, 0};
         Sampler smp;
         assert(sampler_init(&smp, m.config.vocab_size, &sc, err, sizeof(err)) == 0);
         GenerateStats st;
