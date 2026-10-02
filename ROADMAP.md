@@ -1,4 +1,4 @@
-# BitNet-C Development Roadmap (8 Steps)
+# bitnet.c Development Roadmap (8 Steps)
 
 - [x] **Step 1: ARM NEON Ternary Dot-Product Kernel**
   - Implement scalar dot-product baseline
