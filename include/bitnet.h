@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define BITNET_VERSION_STRING "1.0.0"
+#define BITNET_VERSION_STRING "1.1.0"
 
 /* Symbols exported from the shared library (libbitnet.dylib / .so); the
  * engine internals are built with -fvisibility=hidden. */
