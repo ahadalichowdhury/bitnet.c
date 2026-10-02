@@ -229,6 +229,68 @@ void residual_add_neon(float *x, const float *y, int n) {
     for (int i = 0; i < n; i++) x[i] += y[i];
 }
 
+#if defined(BITNET_AVX2_FLOAT)
+/* x86 AVX2 + FMA float path (enabled with F16C, like the f16 output layer;
+ * BITNET_NO_F16C keeps the scalar code for bit-exact comparisons). */
+
+/* Same Cephes-style expf as the NEON exp_f32x4, 8 lanes. */
+static inline __m256 exp_f32x8(__m256 x) {
+    x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-87.3f)), _mm256_set1_ps(88.0f));
+    const __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)),
+                                     _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693359375f), x);
+    r = _mm256_fnmadd_ps(n, _mm256_set1_ps(-2.12194440e-4f), r);
+    __m256 p = _mm256_set1_ps(1.9875691500e-4f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.3981999507e-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519073e-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665795894e-2f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665459e-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.0000001201e-1f));
+    const __m256 y = _mm256_add_ps(_mm256_fmadd_ps(p, _mm256_mul_ps(r, r), r), _mm256_set1_ps(1.0f));
+    const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(e));
+}
+
+static inline float hsum_ps_avx2(__m256 v) {
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 1));
+    return _mm_cvtss_f32(h);
+}
+
+void exp_neon(float *out, const float *x, int n) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) _mm256_storeu_ps(out + i, exp_f32x8(_mm256_loadu_ps(x + i)));
+    if (i < n) {
+        float tmp[8] = {0};
+        memcpy(tmp, x + i, (size_t)(n - i) * sizeof(float));
+        _mm256_storeu_ps(tmp, exp_f32x8(_mm256_loadu_ps(tmp)));
+        memcpy(out + i, tmp, (size_t)(n - i) * sizeof(float));
+    }
+}
+
+static inline float exp_shift_sum(float *row, int n, float mx) {
+    const __m256 vm = _mm256_set1_ps(mx);
+    __m256 vs = _mm256_setzero_ps();
+    int t = 0;
+    for (; t + 8 <= n; t += 8) {
+        const __m256 e = exp_f32x8(_mm256_sub_ps(_mm256_loadu_ps(row + t), vm));
+        _mm256_storeu_ps(row + t, e);
+        vs = _mm256_add_ps(vs, e);
+    }
+    float l = hsum_ps_avx2(vs);
+    if (t < n) {
+        float tmp[8] = {0};
+        for (int j = 0; j < n - t; j++) tmp[j] = row[t + j] - mx;
+        _mm256_storeu_ps(tmp, exp_f32x8(_mm256_loadu_ps(tmp)));
+        for (int j = 0; j < n - t; j++) {
+            row[t + j] = tmp[j];
+            l += tmp[j];
+        }
+    }
+    return l;
+}
+#else
 void exp_neon(float *out, const float *x, int n) {
     for (int i = 0; i < n; i++) out[i] = expf(x[i]);
 }
@@ -238,6 +300,7 @@ static inline float exp_shift_sum(float *row, int n, float mx) {
     for (int t = 0; t < n; t++) l += (row[t] = expf(row[t] - mx));
     return l;
 }
+#endif
 
 void softmax_neon(float *x, int n) {
     float mx = x[0];
@@ -269,6 +332,30 @@ void apply_rope_neon(float *vec, int n_heads, int head_dim, const float *cos, co
     }
 }
 
+#if defined(BITNET_AVX2_FLOAT)
+static inline float dot_f32(const float *a, const float *b, int n) {
+    __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
+        s2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), s2);
+        s3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), s3);
+    }
+    for (; i + 8 <= n; i += 8) s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+    float s = hsum_ps_avx2(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)));
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+static inline void axpy_f32(float *y, float a, const float *x, int n) {
+    const __m256 va = _mm256_set1_ps(a);
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+    for (; i < n; i++) y[i] += a * x[i];
+}
+#else
 static inline float dot_f32(const float *a, const float *b, int n) {
     float s = 0.0f;
     for (int i = 0; i < n; i++) s += a[i] * b[i];
@@ -278,6 +365,7 @@ static inline float dot_f32(const float *a, const float *b, int n) {
 static inline void axpy_f32(float *y, float a, const float *x, int n) {
     for (int i = 0; i < n; i++) y[i] += a * x[i];
 }
+#endif
 
 #endif /* BITNET_NEON */
 
@@ -495,33 +583,44 @@ void f16_to_f32_row(float *out, const uint16_t *h, int n) {
 /* Attention (GQA-grouped, split-softmax over position chunks)               */
 /* ========================================================================= */
 
+/* One job covers the attention of n consecutive tokens (positions pos0..pos0+n-1):
+ * items are (token, kv head, chunk of ATTN_CHUNK positions). */
 typedef struct {
-    float          *out;
-    const float    *q;
-    const uint16_t *kc, *vc; /* float16 cache */
-    float          *part;
-    int          pos, n_kv, group, hd, kv_dim, n_chunks;
-    float        scale;
+    float          *out;      /* [n][q_dim] */
+    const float    *q;        /* [n][q_dim] */
+    const uint16_t *kc, *vc;  /* this layer's float16 cache */
+    float          *part;     /* [n][part_stride] split-softmax partials */
+    size_t          part_stride;
+    int             pos0, n, n_kv, group, hd, kv_dim, q_dim;
+    float           scale;
+    size_t          first[TRANSFORMER_BATCH + 1]; /* first item of each token */
 } attn_job;
 
-static size_t attn_slot(const attn_job *a, int head, int chunk) {
-    return ((size_t)head * a->n_chunks + chunk) * (size_t)(a->hd + 2);
+static int attn_chunks(int pos) { return (pos + ATTN_CHUNK) / ATTN_CHUNK; }
+
+static size_t attn_slot(const attn_job *a, int n_chunks, int head, int chunk) {
+    return ((size_t)head * n_chunks + chunk) * (size_t)(a->hd + 2);
 }
 
-/* One (kv head, chunk) item: scores for every query head of the group, a local
- * softmax (max m, sum l) and the unnormalized value sum o, stored as
- * part[head][chunk] = {m, l, o[hd]}. Each K and V row is read once. */
+/* One (token, kv head, chunk) item: scores for every query head of the group,
+ * a local softmax (max m, sum l) and the unnormalized value sum o, stored as
+ * part[token][head][chunk] = {m, l, o[hd]}. Each K and V row is read once. */
 static void attn_item(void *ctx, size_t item) {
     const attn_job *a = ctx;
-    const int kvh = (int)item / a->n_chunks, c = (int)item % a->n_chunks;
-    const int t0 = c * ATTN_CHUNK, t1 = t0 + ATTN_CHUNK < a->pos + 1 ? t0 + ATTN_CHUNK : a->pos + 1;
+    int tok = 0;
+    while (item >= a->first[tok + 1]) tok++;
+    const int pos = a->pos0 + tok, n_chunks = attn_chunks(pos);
+    const size_t local = item - a->first[tok];
+    const int kvh = (int)(local / (size_t)n_chunks), c = (int)(local % (size_t)n_chunks);
+    const int t0 = c * ATTN_CHUNK, t1 = t0 + ATTN_CHUNK < pos + 1 ? t0 + ATTN_CHUNK : pos + 1;
     const int nt = t1 - t0, hd = a->hd, G = a->group;
     const uint16_t *K = a->kc + (size_t)kvh * hd, *V = a->vc + (size_t)kvh * hd;
+    float *part = a->part + (size_t)tok * a->part_stride;
     float sc[ATTN_MAX_GROUP][ATTN_CHUNK];
     float row[ATTN_MAX_HEAD_DIM]; /* one K or V row widened to float32 */
 
-    const float *qg = a->q + (size_t)kvh * G * hd;
-#ifdef BITNET_NEON
+    const float *qg = a->q + (size_t)tok * a->q_dim + (size_t)kvh * G * hd;
+#if defined(BITNET_NEON)
     if (G == 4 && hd % 8 == 0) {
         /* Score pass for 4 query heads per K row: each K element is loaded once
          * and feeds 4 FMAs (vs. one load per FMA with per-head dot products). */
@@ -547,6 +646,32 @@ static void attn_item(void *ctx, size_t item) {
             sc[3][t - t0] = vaddvq_f32(vaddq_f32(s3, u3)) * a->scale;
         }
     } else
+#elif defined(BITNET_AVX2_FLOAT)
+    if (G == 4 && hd % 16 == 0) {
+        /* Same blocking on x86: 8 float16 K values widened per VCVTPH2PS feed 4
+         * heads; two accumulators per head halve the FMA dependency chains. */
+        for (int t = t0; t < t1; t++) {
+            const uint16_t *k = K + (size_t)t * a->kv_dim;
+            __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+            __m256 u0 = s0, u1 = s0, u2 = s0, u3 = s0;
+            for (int i = 0; i < hd; i += 16) {
+                const __m256 k0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(k + i)));
+                const __m256 k1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(k + i + 8)));
+                s0 = _mm256_fmadd_ps(_mm256_loadu_ps(qg + i), k0, s0);
+                u0 = _mm256_fmadd_ps(_mm256_loadu_ps(qg + i + 8), k1, u0);
+                s1 = _mm256_fmadd_ps(_mm256_loadu_ps(qg + hd + i), k0, s1);
+                u1 = _mm256_fmadd_ps(_mm256_loadu_ps(qg + hd + i + 8), k1, u1);
+                s2 = _mm256_fmadd_ps(_mm256_loadu_ps(qg + 2 * hd + i), k0, s2);
+                u2 = _mm256_fmadd_ps(_mm256_loadu_ps(qg + 2 * hd + i + 8), k1, u2);
+                s3 = _mm256_fmadd_ps(_mm256_loadu_ps(qg + 3 * hd + i), k0, s3);
+                u3 = _mm256_fmadd_ps(_mm256_loadu_ps(qg + 3 * hd + i + 8), k1, u3);
+            }
+            sc[0][t - t0] = hsum_ps_avx2(_mm256_add_ps(s0, u0)) * a->scale;
+            sc[1][t - t0] = hsum_ps_avx2(_mm256_add_ps(s1, u1)) * a->scale;
+            sc[2][t - t0] = hsum_ps_avx2(_mm256_add_ps(s2, u2)) * a->scale;
+            sc[3][t - t0] = hsum_ps_avx2(_mm256_add_ps(s3, u3)) * a->scale;
+        }
+    } else
 #endif
     {
         for (int t = t0; t < t1; t++) {
@@ -560,13 +685,13 @@ static void attn_item(void *ctx, size_t item) {
         float mx = sg[0];
         for (int t = 1; t < nt; t++) mx = sg[t] > mx ? sg[t] : mx;
         const float l = exp_shift_sum(sg, nt, mx);
-        float *slot = a->part + attn_slot(a, kvh * G + g, c);
+        float *slot = part + attn_slot(a, n_chunks, kvh * G + g, c);
         slot[0] = mx;
         slot[1] = l;
         o[g] = slot + 2;
         memset(o[g], 0, (size_t)hd * sizeof(float));
     }
-#ifdef BITNET_NEON
+#if defined(BITNET_NEON)
     if (G == 4 && hd % 16 == 0) {
         /* Register-blocked value pass for the common 4-query-heads-per-KV-head
          * case: 4 heads x 16 dims of output stay in 16 NEON registers while the
@@ -594,6 +719,29 @@ static void attn_item(void *ctx, size_t item) {
         }
         return;
     }
+#elif defined(BITNET_AVX2_FLOAT)
+    if (G == 4 && hd % 16 == 0) {
+        /* 4 heads x 16 dims of output in 8 AVX registers while V rows stream by. */
+        for (int i0 = 0; i0 < hd; i0 += 16) {
+            __m256 acc[4][2];
+            for (int g = 0; g < 4; g++) acc[g][0] = acc[g][1] = _mm256_setzero_ps();
+            for (int t = t0; t < t1; t++) {
+                const uint16_t *v = V + (size_t)t * a->kv_dim + i0;
+                const __m256 v0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)v));
+                const __m256 v1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(v + 8)));
+                for (int g = 0; g < 4; g++) {
+                    const __m256 p = _mm256_set1_ps(sc[g][t - t0]);
+                    acc[g][0] = _mm256_fmadd_ps(v0, p, acc[g][0]);
+                    acc[g][1] = _mm256_fmadd_ps(v1, p, acc[g][1]);
+                }
+            }
+            for (int g = 0; g < 4; g++) {
+                _mm256_storeu_ps(o[g] + i0, acc[g][0]);
+                _mm256_storeu_ps(o[g] + i0 + 8, acc[g][1]);
+            }
+        }
+        return;
+    }
 #endif
     for (int t = t0; t < t1; t++) {
         f16_to_f32_row(row, V + (size_t)t * a->kv_dim, hd);
@@ -606,43 +754,61 @@ size_t attention_scratch_floats(int n_heads, int head_dim, int max_seq_len) {
     return (size_t)n_heads * chunks * (size_t)(head_dim + 2);
 }
 
-void attention_neon(float *out, const float *q, const uint16_t *k_cache, const uint16_t *v_cache,
-                    int pos, int n_heads, int n_kv_heads, int head_dim, int kv_dim, float *part,
-                    threadpool *pool) {
-    attn_job a = {out, q, k_cache, v_cache, part, pos, n_kv_heads, n_heads / n_kv_heads, head_dim,
-                  kv_dim, (pos + ATTN_CHUNK) / ATTN_CHUNK, 1.0f / sqrtf((float)head_dim)};
-    const size_t items = (size_t)n_kv_heads * (size_t)a.n_chunks;
-    if (pos + 1 >= ATTN_PARALLEL_MIN_POS) {
-        threadpool_run(pool, items, &a, attn_item);
+/* Attention for n tokens at positions pos0.. in one pool job (n_heads*hd per
+ * token in q/out, part_stride floats of scratch per token). Each token's
+ * result is identical to a separate single-token call. */
+static void attention_batch(float *out, const float *q, const uint16_t *k_cache, const uint16_t *v_cache,
+                            int pos0, int n, int n_heads, int n_kv_heads, int head_dim, int kv_dim,
+                            float *part, size_t part_stride, threadpool *pool) {
+    attn_job a = {out, q, k_cache, v_cache, part, part_stride, pos0, n, n_kv_heads,
+                  n_heads / n_kv_heads, head_dim, kv_dim, n_heads * head_dim,
+                  1.0f / sqrtf((float)head_dim), {0}};
+    size_t work = 0;
+    for (int t = 0; t < n; t++) {
+        a.first[t + 1] = a.first[t] + (size_t)n_kv_heads * (size_t)attn_chunks(pos0 + t);
+        work += (size_t)(pos0 + t + 1);
+    }
+    if (work >= ATTN_PARALLEL_MIN_POS) {
+        threadpool_run(pool, a.first[n], &a, attn_item);
     } else {
-        for (size_t i = 0; i < items; i++) attn_item(&a, i);
+        for (size_t i = 0; i < a.first[n]; i++) attn_item(&a, i);
     }
 
     /* Merge chunk partials: out = sum_c e^(m_c - M) o_c / sum_c e^(m_c - M) l_c. */
-    for (int h = 0; h < n_heads; h++) {
-        float *dst = out + (size_t)h * head_dim;
-        if (a.n_chunks == 1) {
-            const float *slot = part + attn_slot(&a, h, 0);
-            const float inv = 1.0f / slot[1];
-            for (int i = 0; i < head_dim; i++) dst[i] = slot[2 + i] * inv;
-            continue;
+    for (int t = 0; t < n; t++) {
+        const int n_chunks = attn_chunks(pos0 + t);
+        const float *pt = part + (size_t)t * part_stride;
+        for (int h = 0; h < n_heads; h++) {
+            float *dst = out + (size_t)t * a.q_dim + (size_t)h * head_dim;
+            if (n_chunks == 1) {
+                const float *slot = pt + attn_slot(&a, 1, h, 0);
+                const float inv = 1.0f / slot[1];
+                for (int i = 0; i < head_dim; i++) dst[i] = slot[2 + i] * inv;
+                continue;
+            }
+            float M = -INFINITY;
+            for (int c = 0; c < n_chunks; c++) {
+                const float m = pt[attn_slot(&a, n_chunks, h, c)];
+                M = m > M ? m : M;
+            }
+            float L = 0.0f;
+            memset(dst, 0, (size_t)head_dim * sizeof(float));
+            for (int c = 0; c < n_chunks; c++) {
+                const float *slot = pt + attn_slot(&a, n_chunks, h, c);
+                const float w = expf(slot[0] - M);
+                L += w * slot[1];
+                axpy_f32(dst, w, slot + 2, head_dim);
+            }
+            const float inv = 1.0f / L;
+            for (int i = 0; i < head_dim; i++) dst[i] *= inv;
         }
-        float M = -INFINITY;
-        for (int c = 0; c < a.n_chunks; c++) {
-            const float m = part[attn_slot(&a, h, c)];
-            M = m > M ? m : M;
-        }
-        float L = 0.0f;
-        memset(dst, 0, (size_t)head_dim * sizeof(float));
-        for (int c = 0; c < a.n_chunks; c++) {
-            const float *slot = part + attn_slot(&a, h, c);
-            const float w = expf(slot[0] - M);
-            L += w * slot[1];
-            axpy_f32(dst, w, slot + 2, head_dim);
-        }
-        const float inv = 1.0f / L;
-        for (int i = 0; i < head_dim; i++) dst[i] *= inv;
     }
+}
+
+void attention_neon(float *out, const float *q, const uint16_t *k_cache, const uint16_t *v_cache,
+                    int pos, int n_heads, int n_kv_heads, int head_dim, int kv_dim, float *part,
+                    threadpool *pool) {
+    attention_batch(out, q, k_cache, v_cache, pos, 1, n_heads, n_kv_heads, head_dim, kv_dim, part, 0, pool);
 }
 
 /* ========================================================================= */
@@ -683,7 +849,7 @@ int runstate_init(RunState *s, const BitNetModel *m, int max_seq_len, int n_thre
     struct { void **p; size_t bytes; } parts[] = {
         {(void **)&s->x, B * c->dim * 4},              {(void **)&s->xb, B * c->dim * 4},
         {(void **)&s->xb2, B * q_dim * 4},             {(void **)&s->q, B * q_dim * 4},
-        {(void **)&s->attn_part, attention_scratch_floats(c->n_heads, hd, max_seq_len) * 4},
+        {(void **)&s->attn_part, B * attention_scratch_floats(c->n_heads, hd, max_seq_len) * 4},
         {(void **)&s->hb, B * c->hidden_dim * 4},      {(void **)&s->hb2, B * c->hidden_dim * 4},
         {(void **)&s->logits, (size_t)c->vocab_size * 4},
         {(void **)&s->xq, BQ * s->xq_stride},
@@ -825,11 +991,11 @@ static void forward_chunk(const int32_t *tokens, int n, int pos, const BitNetMod
         f32_to_f16_row(vc, s->vf, n * kv_dim);
         PROF_MARK(attn_proj);
 
-        /* ---- Causal attention for each token over positions 0..pos+t (GQA). */
-        for (int t = 0; t < n; t++)
-            attention_neon(ROW(s->xb2, t, q_dim), ROW(s->q, t, q_dim), s->key_cache + layer_off,
-                           s->value_cache + layer_off, pos + t, c->n_heads, c->n_kv_heads, hd, kv_dim,
-                           s->attn_part, s->pool);
+        /* ---- Causal attention of each token over positions 0..pos+t (GQA), all
+         *      tokens of the chunk in one pool job. */
+        attention_batch(s->xb2, s->q, s->key_cache + layer_off, s->value_cache + layer_off, pos, n,
+                        c->n_heads, c->n_kv_heads, hd, kv_dim, s->attn_part,
+                        attention_scratch_floats(c->n_heads, hd, s->max_seq_len), s->pool);
         PROF_MARK(attention);
 
         for (int t = 0; t < n; t++) {
