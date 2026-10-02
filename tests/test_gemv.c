@@ -378,8 +378,8 @@ static void run_i128_verification(void) {
         cases++;
     }
     free(act); free(w4); free(w128); free(ref); free(sc); free(st); free(mt);
-    printf("I128 layout:    PASSED (%d cases: scalar == SIMD-1T == SIMD-MT == ROW4 reference, "
-           "tails, -128 activations, reserved codes)\n", cases);
+    printf("I128 layout:    PASSED (%d cases, %s: scalar == SIMD-1T == SIMD-MT == ROW4 reference, "
+           "tails, -128 activations, reserved codes)\n", cases, TERNARY_I128_PATH);
 }
 
 /* Batched GEMM (prefill) == per-token scalar GEMV, both layouts, every
@@ -421,8 +421,8 @@ static void run_gemm_verification(void) {
         }
     }
     free(act); free(w4); free(w128); free(ref); free(got);
-    printf("Batched GEMM:   PASSED (%d cases: == per-token scalar GEMV, ROW4 + I128, T = 1..%d "
-           "tokens, K tails / tiles, -128 activations)\n", cases, GEMM_MAX_T);
+    printf("Batched GEMM:   PASSED (%d cases, %s: == per-token scalar GEMV, ROW4 + I128, T = 1..%d "
+           "tokens, K tails / tiles, -128 activations)\n", cases, TERNARY_I128_PATH, GEMM_MAX_T);
 }
 
 /* T separate GEMVs vs one batched GEMM over the same weights (prefill). */
@@ -449,7 +449,8 @@ static void run_gemm_benchmark(int quick) {
             const double ms = (double)(now_ns() - t0) / 1e6;
             best[v] = ms < best[v] ? ms : best[v];
         }
-    printf("\nBatched GEMM: M=%d K=%d, %d tokens, I128, 1 thread, best of %d\n", M, K, T, calls);
+    printf("\nBatched GEMM: M=%d K=%d, %d tokens, I128 %s, 1 thread, best of %d\n", M, K, T,
+           TERNARY_I128_PATH, calls);
     printf("  %d x GEMV     %8.3f ms  (%.3f ms/token)\n", T, best[0], best[0] / T);
     printf("  GEMM          %8.3f ms  (%.3f ms/token)  %.2fx\n", best[1], best[1] / T, best[0] / best[1]);
     free(act); free(w4); free(w128); free(out);
@@ -602,7 +603,8 @@ static void run_layout_benchmark(int quick) {
             }
             best[L][par] = b;
         }
-    printf("\nLayout benchmark: M=%d K=%d, best of %d calls (%s)\n", M, K, calls, TERNARY_DOT_PATH);
+    printf("\nLayout benchmark: M=%d K=%d, best of %d calls (ROW4 %s, I128 %s)\n", M, K, calls,
+           TERNARY_DOT_PATH, TERNARY_I128_PATH);
     printf("  %-14s %12s %12s\n", "layout", "1 thread", "all threads");
     printf("  %-14s %9.3f ms %9.3f ms\n", "ROW4 (v1)", best[0][0], best[0][1]);
     printf("  %-14s %9.3f ms %9.3f ms\n", "I128 (v2)", best[1][0], best[1][1]);

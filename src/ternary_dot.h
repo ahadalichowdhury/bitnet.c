@@ -212,6 +212,8 @@ static inline int32_t ternary_dot_i128_scalar_range(const int8_t *act, const uin
     acc = TERNARY_DOT(acc, vqtbl1q_s8(lut, (f) == 3 ? vshrq_n_u8(ph, 6)                  \
                                                     : vandq_u8(vshrq_n_u8(ph, 2 * (f)), m3)), (a))
 
+#define TERNARY_I128_PATH TERNARY_DOT_PATH
+
 static inline int32_t ternary_dot_i128(const int8_t *act, const uint8_t *w, int K) {
     const int8x16_t lut = vld1q_s8(k_ternary_lut);
     const uint8x16_t m3 = vdupq_n_u8(3);
@@ -269,13 +271,50 @@ static inline __m256i i128_block_asum16(const int8_t *a) {
     return _mm256_add_epi16(s, _mm256_maddubs_epi16(one, _mm256_loadu_si256((const __m256i *)(a + 96))));
 }
 
+/* acc += int32 partial sums of (w+1)*a over one block: VPDPBUSD (4 per block)
+ * with VNNI, else the int16 MADDUBS sums widened by MADD. Both exact. */
+static inline __m256i i128_block_acc(__m256i acc, const uint8_t *wb, const int8_t *a, __m256i lut,
+                                     __m256i m3) {
+#ifdef BITNET_VNNI
+    const __m256i p = _mm256_loadu_si256((const __m256i *)wb);
+    acc = BITNET_DPBUSD(acc, _mm256_shuffle_epi8(lut, _mm256_and_si256(p, m3)),
+                        _mm256_loadu_si256((const __m256i *)a));
+    acc = BITNET_DPBUSD(acc, _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 2), m3)),
+                        _mm256_loadu_si256((const __m256i *)(a + 32)));
+    acc = BITNET_DPBUSD(acc, _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 4), m3)),
+                        _mm256_loadu_si256((const __m256i *)(a + 64)));
+    return BITNET_DPBUSD(acc, _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 6), m3)),
+                         _mm256_loadu_si256((const __m256i *)(a + 96)));
+#else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(i128_block_u16(wb, a, lut, m3), _mm256_set1_epi16(1)));
+#endif
+}
+
+/* acc += int32 partial sums of a over one block (the -sum(a) correction). */
+static inline __m256i i128_asum_acc(__m256i acc, const int8_t *a) {
+#ifdef BITNET_VNNI
+    const __m256i one = _mm256_set1_epi8(1);
+    for (int f = 0; f < 4; f++)
+        acc = BITNET_DPBUSD(acc, one, _mm256_loadu_si256((const __m256i *)(a + 32 * f)));
+    return acc;
+#else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(i128_block_asum16(a), _mm256_set1_epi16(1)));
+#endif
+}
+
+#ifdef BITNET_VNNI
+#define TERNARY_I128_PATH "AVX2 + VNNI (VPDPBUSD)"
+#else
+#define TERNARY_I128_PATH "AVX2 (MADDUBS)"
+#endif
+
 static inline int32_t ternary_dot_i128(const int8_t *act, const uint8_t *w, int K) {
-    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3), ones16 = _mm256_set1_epi16(1);
+    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3);
     __m256i acc = _mm256_setzero_si256(), asum = _mm256_setzero_si256();
     const int full = K & ~127;
     for (int b = 0; b < full; b += 128) {
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(i128_block_u16(w + (b >> 2), act + b, lut, m3), ones16));
-        asum = _mm256_add_epi32(asum, _mm256_madd_epi16(i128_block_asum16(act + b), ones16));
+        acc = i128_block_acc(acc, w + (b >> 2), act + b, lut, m3);
+        asum = i128_asum_acc(asum, act + b);
     }
     int32_t sum = hsum_epi32_avx2(_mm256_sub_epi32(acc, asum)); /* sum((w+1)a) - sum(a) */
     if (full < K) sum += ternary_dot_i128_scalar_range(act, w, full, K);
@@ -283,6 +322,8 @@ static inline int32_t ternary_dot_i128(const int8_t *act, const uint8_t *w, int 
 }
 
 #else
+
+#define TERNARY_I128_PATH TERNARY_DOT_PATH
 
 static inline int32_t ternary_dot_i128(const int8_t *act, const uint8_t *w, int K) {
     return ternary_dot_i128_scalar_range(act, w, 0, K);

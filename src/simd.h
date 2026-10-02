@@ -29,6 +29,19 @@
 #if defined(__F16C__)
 #define BITNET_F16C_CVT 1
 #endif
+/* VNNI (VPDPBUSD: u8 x s8 products, 4 per int32 lane, accumulated without
+ * saturation) replaces MADDUBS + MADD + ADD in the integer kernels. AVX-VNNI
+ * (Alder Lake+, Zen 5) or AVX512-VNNI with VL on 256-bit registers (Ice Lake,
+ * Sapphire Rapids, Zen 4). Exact like the AVX2 path; BITNET_NO_VNNI turns it off. */
+#if !defined(BITNET_NO_VNNI)
+#if defined(__AVXVNNI__)
+#define BITNET_VNNI 1
+#define BITNET_DPBUSD(acc, u, s) _mm256_dpbusd_avx_epi32((acc), (u), (s))
+#elif defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#define BITNET_VNNI 1
+#define BITNET_DPBUSD(acc, u, s) _mm256_dpbusd_epi32((acc), (u), (s))
+#endif
+#endif
 #if defined(__FMA__)
 #define BITNET_FMADD(a, b, c) _mm256_fmadd_ps((a), (b), (c))
 #else
