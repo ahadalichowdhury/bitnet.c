@@ -1,4 +1,4 @@
-# BitNet-C — BitNet b1.58 inference engine for Apple Silicon (pure C11 + ARM NEON)
+# bitnet.c — BitNet b1.58 inference engine for Apple Silicon (pure C11 + ARM NEON)
 #
 #   make            build the `bitnet` CLI, libbitnet.a and all test programs
 #   make bitnet     build the CLI only

@@ -1,4 +1,4 @@
-# BitNet-C
+# bitnet.c
 
 A dependency-free C11 inference engine for **BitNet b1.58** ternary models
 (`{-1, 0, +1}` weights), hand-tuned for Apple Silicon with ARM NEON. Runs
@@ -14,6 +14,8 @@ The capital of Japan is Tokyo.
 ## Quick start
 
 ```sh
+git clone https://github.com/ahadalichowdhury/bitnet.c.git && cd bitnet.c
+
 # 1. Get and convert the model (numpy only; ~1.2 GB download)
 mkdir -p models/hf/bitnet-b1.58-2B-4T && cd models/hf/bitnet-b1.58-2B-4T
 for f in config.json tokenizer.json tokenizer_config.json model.safetensors; do

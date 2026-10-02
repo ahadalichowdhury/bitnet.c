@@ -1,4 +1,4 @@
-# Project: BitNet-C Inference Engine (Apple Silicon ARM NEON)
+# Project: bitnet.c — BitNet b1.58 Inference Engine (Apple Silicon ARM NEON)
 
 ## Project Overview
 A standalone, dependency-free C inference runtime for 1-bit / 1.58-bit ternary models (`{-1, 0, 1}`) optimized for Apple Silicon (ARM NEON).
