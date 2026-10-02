@@ -1,0 +1,9 @@
+build/
+build-*/
+/bitnet
+*.o
+*.a
+*.d
+models/
+__pycache__/
+.DS_Store
