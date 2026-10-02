@@ -16,3 +16,9 @@ jobs:
         run: make -j
       - name: Unit + mock-model tests (scalar fallbacks on x86-64)
         run: make test-mock
+      - name: Shared library + Python bindings
+        run: |
+          make lib
+          test -f build/libbitnet.so && test -f build/libbitnet.a
+          python3 tools/bitnet.py          # loads libbitnet.so via ctypes; no model -> error path only
+          ./tools/download_model.sh --help | head -3

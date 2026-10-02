@@ -32,6 +32,14 @@ extern "C" {
 
 #define BITNET_VERSION_STRING "1.0.0"
 
+/* Symbols exported from the shared library (libbitnet.dylib / .so); the
+ * engine internals are built with -fvisibility=hidden. */
+#if defined(__GNUC__) || defined(__clang__)
+#define BITNET_API __attribute__((visibility("default")))
+#else
+#define BITNET_API
+#endif
+
 typedef struct BitNetContext BitNetContext;
 
 /* Engine configuration (fixed for the lifetime of a context). */
@@ -85,47 +93,47 @@ typedef struct {
     size_t process_peak_resident_bytes;
 } BitNetMemoryInfo;
 
-BitNetConfig       bitnet_default_config(void);
-BitNetSampleParams bitnet_default_params(void); /* model card: temp 0.6, top-p 0.9 */
+BITNET_API BitNetConfig       bitnet_default_config(void);
+BITNET_API BitNetSampleParams bitnet_default_params(void); /* model card: temp 0.6, top-p 0.9 */
 
 /* Loads the model (mmap, zero-copy) and tokenizer and allocates all buffers.
  * Returns NULL on failure; bitnet_last_error(NULL) then explains why. */
-BitNetContext *bitnet_init(const char *model_path, const char *tokenizer_path, BitNetConfig config);
-void bitnet_free(BitNetContext *ctx); /* NULL is allowed */
+BITNET_API BitNetContext *bitnet_init(const char *model_path, const char *tokenizer_path, BitNetConfig config);
+BITNET_API void bitnet_free(BitNetContext *ctx); /* NULL is allowed */
 
 /* Plain text completion of `prompt` (BOS + prompt, no chat template). Starts
  * from an empty KV cache, so it also discards the chat history. */
-void bitnet_generate(BitNetContext *ctx, const char *prompt, BitNetSampleParams params,
+BITNET_API void bitnet_generate(BitNetContext *ctx, const char *prompt, BitNetSampleParams params,
                      bitnet_token_fn on_token, void *user_data);
 
 /* One chat turn: appends "User: {user_msg}" to the conversation, streams the
  * assistant's reply. The KV cache is reused across turns, so only the new
  * message is prefilled. If the conversation no longer fits, it is restarted
  * with this message (stats.context_reset = 1). */
-void bitnet_chat_turn(BitNetContext *ctx, const char *user_msg, BitNetSampleParams params,
+BITNET_API void bitnet_chat_turn(BitNetContext *ctx, const char *user_msg, BitNetSampleParams params,
                       bitnet_token_fn on_token, void *user_data);
 
 /* Forgets the conversation (the system prompt is kept). */
-void bitnet_reset_chat(BitNetContext *ctx);
+BITNET_API void bitnet_reset_chat(BitNetContext *ctx);
 
 /* Replaces the system prompt (copied; NULL = none) and resets the chat.
  * Returns 0, or -1 if out of memory. */
-int bitnet_set_system_prompt(BitNetContext *ctx, const char *system_prompt);
+BITNET_API int bitnet_set_system_prompt(BitNetContext *ctx, const char *system_prompt);
 
 /* Requests the running generation to stop after the current token.
  * Async-signal-safe and thread-safe. A no-op when nothing is running. */
-void bitnet_cancel(BitNetContext *ctx);
+BITNET_API void bitnet_cancel(BitNetContext *ctx);
 
 /* Results of the last call. Returns 0, or -1 if ctx is NULL. */
-int bitnet_last_stats(const BitNetContext *ctx, BitNetStats *out);
-int bitnet_memory_info(const BitNetContext *ctx, BitNetMemoryInfo *out);
+BITNET_API int bitnet_last_stats(const BitNetContext *ctx, BitNetStats *out);
+BITNET_API int bitnet_memory_info(const BitNetContext *ctx, BitNetMemoryInfo *out);
 
 /* Human-readable model summary (e.g. "BitNet b1.58 2B: 30 layers, ..."). */
-const char *bitnet_model_description(const BitNetContext *ctx);
+BITNET_API const char *bitnet_model_description(const BitNetContext *ctx);
 
 /* Last error message for ctx, or of the last failed bitnet_init on this
  * thread when ctx is NULL. Never NULL ("" when there is no error). */
-const char *bitnet_last_error(const BitNetContext *ctx);
+BITNET_API const char *bitnet_last_error(const BitNetContext *ctx);
 
 #ifdef __cplusplus
 }
