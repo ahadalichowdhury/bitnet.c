@@ -218,7 +218,7 @@ static void run_verification(void) {
     free(b.sc);
     free(b.st);
     free(b.mt);
-    printf("Verification: PASSED (%d cases, M x K from 1x1 to 4096x11008; scalar == NEON-1T == NEON-MT)\n",
+    printf("Verification: PASSED (%d cases, M x K from 1x1 to 4096x11008; scalar == SIMD-1T == SIMD-MT)\n",
            cases);
 }
 

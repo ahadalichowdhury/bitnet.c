@@ -61,7 +61,17 @@ TESTS := $(BUILD)/test_dot_product $(BUILD)/test_gemv $(BUILD)/test_bitlinear \
 
 .PHONY: all lib tests test test-mock bench asan leaks clean
 
-all: bitnet lib tests
+# The CLI is ./bitnet for the default build; variant builds (make BUILD=...)
+# write $(BUILD)/bitnet so they never overwrite the main binary.
+ifeq ($(BUILD),build)
+CLI := bitnet
+else
+CLI := $(BUILD)/bitnet
+.PHONY: bitnet
+bitnet: $(CLI)
+endif
+
+all: $(CLI) lib tests
 
 lib: $(LIB) $(SHLIB)
 tests: $(TESTS)
@@ -86,8 +96,8 @@ $(LIB): $(LIB_OBJ)
 $(SHLIB): $(LIB_OBJ)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $^ -lpthread -lm -o $@
 
-# The CLI binary: ./bitnet
-bitnet: $(OBJ)/main.o $(LIB)
+# The CLI binary: ./bitnet (or $(BUILD)/bitnet for variant builds)
+$(CLI): $(OBJ)/main.o $(LIB)
 	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
 
 # ---- test programs ----------------------------------------------------------
@@ -141,8 +151,8 @@ test-mock: tests | $(BUILD)
 	  else echo "(tokenizer.json not found: tokenizer/transformer suites skipped)"; fi
 	@echo "== mock tests passed"
 
-bench: bitnet
-	./bitnet --model $(MODEL) --tokenizer $(TOKENIZER) --bench
+bench: $(CLI)
+	./$(CLI) --model $(MODEL) --tokenizer $(TOKENIZER) --bench
 
 asan: | $(BUILD)
 	$(CC) $(SANFLAGS) app/main.c $(LIB_SRC) -o $(BUILD)/bitnet-asan
@@ -153,12 +163,12 @@ asan: | $(BUILD)
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	  $(BUILD)/test_api-asan $(MODEL) $(TOKENIZER)
 
-leaks: bitnet $(BUILD)/test_api
+leaks: $(CLI) $(BUILD)/test_api
 	MallocStackLogging=1 leaks --atExit -- $(BUILD)/test_api $(MODEL) $(TOKENIZER) | grep -E "leaks for|PASSED"
-	MallocStackLogging=1 leaks --atExit -- ./bitnet --model $(MODEL) --tokenizer $(TOKENIZER) \
+	MallocStackLogging=1 leaks --atExit -- ./$(CLI) --model $(MODEL) --tokenizer $(TOKENIZER) \
 	  -p "Name a color." --temp 0 -n 16 | grep -E "leaks for"
 
 clean:
-	rm -rf $(BUILD) bitnet
+	rm -rf $(BUILD) $(CLI)
 
 -include $(LIB_OBJ:.o=.d) $(OBJ)/main.d $(TESTS:$(BUILD)/%=$(OBJ)/%.d)
