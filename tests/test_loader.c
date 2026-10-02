@@ -190,7 +190,7 @@ static void verify_reference(const bitnet_model *m, const char *ref_path) {
     assert(c.p == c.end);
 
     free(buf); free(x); free(yn); free(ys); free(ye); free(row);
-    printf("Reference check: PASSED (%d ternary tensors: NEON GEMV == scalar GEMV == Python "
+    printf("Reference check: PASSED (%d ternary tensors: SIMD GEMV == scalar GEMV == Python "
            "int32, bit-exact; %u embedding rows bit-exact; beta matches)\n",
            n_tensors_checked, n_emb);
 }

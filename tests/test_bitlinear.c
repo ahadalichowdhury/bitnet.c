@@ -282,7 +282,7 @@ static void verify_quant_kernels(void) {
     }
 
     free(x); free(qs); free(qn); free(yi); free(ys); free(yn);
-    printf("Quant kernels:  PASSED (%d cases; NEON == scalar bit-exact, half-to-even ties, zero input)\n",
+    printf("Quant kernels:  PASSED (%d cases; SIMD == scalar bit-exact, half-to-even ties, zero input)\n",
            cases);
 }
 
@@ -376,7 +376,7 @@ static void verify_layers(void) {
     free(W); free(W_deq); free(Wp); free(x); free(x_deq);
     free(y_neon); free(y_sc); free(y_tern); free(y_fp); free(y_xdq);
     free(ws.x_q); free(ws.y_int);
-    printf("Layer accuracy: PASSED (%d cases; NEON == scalar bit-exact, all within quantization bound)\n",
+    printf("Layer accuracy: PASSED (%d cases; SIMD == scalar bit-exact, all within quantization bound)\n",
            cases);
 }
 
