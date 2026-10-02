@@ -3,7 +3,7 @@
  * with llama.cpp-based engines such as Microsoft's bitnet.cpp
  * (tools/bench_compare.sh runs both).
  *
- *   build/bench_llama MODEL.bitnet [-p 512] [-n 128] [-t THREADS] [-r 5] [--json]
+ *   build/bench_llama MODEL.bitnet [-p 512] [-n 128] [-t THREADS] [-r 5] [--json] [--profile]
  *
  * Same definitions as llama-bench:
  *   ppN  prompt processing: N random tokens from an empty KV cache in one
@@ -12,7 +12,8 @@
  *        KV cache, each producing full logits, tokens/s = N / time
  * One untimed warm-up run of each test (pages the weights in), then r timed
  * repetitions; reported as mean +- sample standard deviation of tokens/s.
- * Sampling and tokenization are excluded, as in llama-bench.
+ * Sampling and tokenization are excluded, as in llama-bench. --profile adds a
+ * per-stage time breakdown (ms per token) of the timed runs.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -64,6 +65,16 @@ static double run_tg(const BitNetModel *m, RunState *s, int n) {
     return (double)(platform_now_ns() - t0) / 1e9;
 }
 
+/* ms per token of each stage accumulated in s->prof since the last reset. */
+static void print_profile(const char *name, const RunState *s) {
+    const transformer_profile *p = &s->prof;
+    const double n = p->tokens ? (double)p->tokens : 1.0, ms = 1e-6;
+    printf("  %-5s ms/token: total %.2f | BitLinear attn (qkv+o) %.2f | attention %.2f | BitLinear ffn %.2f"
+           " | logits %.2f | other %.2f\n", name, p->total * ms / n, p->attn_proj * ms / n,
+           p->attention * ms / n, p->ffn * ms / n, p->logits * ms / n,
+           (double)(p->total - p->attn_proj - p->attention - p->ffn - p->logits) * ms / n);
+}
+
 static void stats(const double *ts, int r, double *mean, double *sd) {
     double s = 0, q = 0;
     for (int i = 0; i < r; i++) s += ts[i];
@@ -74,13 +85,14 @@ static void stats(const double *ts, int r, double *mean, double *sd) {
 
 int main(int argc, char **argv) {
     const char *path = NULL;
-    int pp = 512, tg = 128, threads = 0, reps = 5, json = 0;
+    int pp = 512, tg = 128, threads = 0, reps = 5, json = 0, profile = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i + 1 < argc) pp = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) tg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--json")) json = 1;
+        else if (!strcmp(argv[i], "--profile")) profile = 1;
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else {
             fprintf(stderr, "usage: %s MODEL.bitnet [-p 512] [-n 128] [-t THREADS] [-r 5] [--json]\n", argv[0]);
@@ -107,15 +119,24 @@ int main(int argc, char **argv) {
     int32_t *toks = malloc((size_t)(pp > 0 ? pp : 1) * sizeof(int32_t));
     double *ts = malloc((size_t)reps * sizeof(double));
     double pp_mean = 0, pp_sd = 0, tg_mean = 0, tg_sd = 0;
+    transformer_profile pp_prof = {0}, tg_prof = {0};
 
     if (pp > 0) {
         run_pp(&m, &s, toks, pp); /* warm-up */
+        memset(&s.prof, 0, sizeof(s.prof));
+        s.profile = profile;
         for (int r = 0; r < reps; r++) ts[r] = pp / run_pp(&m, &s, toks, pp);
+        s.profile = 0;
+        pp_prof = s.prof;
         stats(ts, reps, &pp_mean, &pp_sd);
     }
     if (tg > 0) {
         run_tg(&m, &s, tg); /* warm-up */
+        memset(&s.prof, 0, sizeof(s.prof));
+        s.profile = profile;
         for (int r = 0; r < reps; r++) ts[r] = tg / run_tg(&m, &s, tg);
+        s.profile = 0;
+        tg_prof = s.prof;
         stats(ts, reps, &tg_mean, &tg_sd);
     }
 
@@ -133,6 +154,11 @@ int main(int argc, char **argv) {
         if (pp > 0) printf("| pp%-4d | %7.2f +- %4.2f |\n", pp, pp_mean, pp_sd);
         if (tg > 0) printf("| tg%-4d | %7.2f +- %4.2f |\n", tg, tg_mean, tg_sd);
         printf("peak resident: %.1f MiB\n", peak_rss_bytes() / 1048576.0);
+        if (profile) {
+            printf("profile (timed runs; clock reads add a little overhead):\n");
+            if (pp > 0) { s.prof = pp_prof; print_profile("pp", &s); }
+            if (tg > 0) { s.prof = tg_prof; print_profile("tg", &s); }
+        }
     }
     free(toks);
     free(ts);

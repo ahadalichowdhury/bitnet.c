@@ -114,7 +114,7 @@ static inline void ternary_dot4_i128_accumulate(const int8_t *act, const uint8_t
 #elif defined(BITNET_AVX2)
 static inline void ternary_dot4_i128_accumulate(const int8_t *act, const uint8_t *w, size_t stride,
                                                 int len, int32_t out[4]) {
-    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3), ones16 = _mm256_set1_epi16(1);
+    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3);
     __m256i c0 = _mm256_setzero_si256(), c1 = c0, c2 = c0, c3 = c0, asum = c0;
     const uint8_t *w0 = w, *w1 = w + stride, *w2 = w + 2 * stride, *w3 = w + 3 * stride;
     const int full = len & ~127;
@@ -122,11 +122,11 @@ static inline void ternary_dot4_i128_accumulate(const int8_t *act, const uint8_t
         const int8_t *a = act + b;
         const int j = b >> 2;
         /* sum(w*a) = sum((w+1)*a) - sum(a); sum(a) is shared by the 4 rows. */
-        asum = _mm256_add_epi32(asum, _mm256_madd_epi16(i128_block_asum16(a), ones16));
-        c0 = _mm256_add_epi32(c0, _mm256_madd_epi16(i128_block_u16(w0 + j, a, lut, m3), ones16));
-        c1 = _mm256_add_epi32(c1, _mm256_madd_epi16(i128_block_u16(w1 + j, a, lut, m3), ones16));
-        c2 = _mm256_add_epi32(c2, _mm256_madd_epi16(i128_block_u16(w2 + j, a, lut, m3), ones16));
-        c3 = _mm256_add_epi32(c3, _mm256_madd_epi16(i128_block_u16(w3 + j, a, lut, m3), ones16));
+        asum = i128_asum_acc(asum, a);
+        c0 = i128_block_acc(c0, w0 + j, a, lut, m3);
+        c1 = i128_block_acc(c1, w1 + j, a, lut, m3);
+        c2 = i128_block_acc(c2, w2 + j, a, lut, m3);
+        c3 = i128_block_acc(c3, w3 + j, a, lut, m3);
     }
     const int32_t as = hsum_epi32_avx2(asum);
     out[0] += hsum_epi32_avx2(c0) - as;
@@ -380,7 +380,10 @@ static inline void gemm_asum(const int8_t *act, size_t as, int full, int32_t cor
 #elif defined(BITNET_AVX2)
 static inline void ternary_gemm_i128(const int8_t *act, size_t as, const uint8_t *w, int full,
                                      int32_t out[GEMM_TB]) {
-    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3), ones16 = _mm256_set1_epi16(1);
+    const __m256i lut = i128_lut_u(), m3 = _mm256_set1_epi8(3);
+#ifndef BITNET_VNNI
+    const __m256i ones16 = _mm256_set1_epi16(1);
+#endif
     __m256i c[GEMM_TB];
     for (int t = 0; t < GEMM_TB; t++) c[t] = _mm256_setzero_si256();
     for (int b = 0; b < full; b += 128) {
@@ -391,12 +394,20 @@ static inline void ternary_gemm_i128(const int8_t *act, size_t as, const uint8_t
         const __m256i u3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(p, 6), m3));
         for (int t = 0; t < GEMM_TB; t++) {
             const int8_t *a = act + (size_t)t * as + b;
+#ifdef BITNET_VNNI
+            __m256i ct = c[t];
+            ct = BITNET_DPBUSD(ct, u0, _mm256_loadu_si256((const __m256i *)a));
+            ct = BITNET_DPBUSD(ct, u1, _mm256_loadu_si256((const __m256i *)(a + 32)));
+            ct = BITNET_DPBUSD(ct, u2, _mm256_loadu_si256((const __m256i *)(a + 64)));
+            c[t] = BITNET_DPBUSD(ct, u3, _mm256_loadu_si256((const __m256i *)(a + 96)));
+#else
             /* 4 MADDUBS lanes in [-512, 508] each: the int16 sum cannot overflow. */
             __m256i s = _mm256_maddubs_epi16(u0, _mm256_loadu_si256((const __m256i *)a));
             s = _mm256_add_epi16(s, _mm256_maddubs_epi16(u1, _mm256_loadu_si256((const __m256i *)(a + 32))));
             s = _mm256_add_epi16(s, _mm256_maddubs_epi16(u2, _mm256_loadu_si256((const __m256i *)(a + 64))));
             s = _mm256_add_epi16(s, _mm256_maddubs_epi16(u3, _mm256_loadu_si256((const __m256i *)(a + 96))));
             c[t] = _mm256_add_epi32(c[t], _mm256_madd_epi16(s, ones16));
+#endif
         }
     }
     for (int t = 0; t < GEMM_TB; t++) out[t] += hsum_epi32_avx2(c[t]);
@@ -404,11 +415,9 @@ static inline void ternary_gemm_i128(const int8_t *act, size_t as, const uint8_t
 
 /* corr[t] = sum(act[t][0, full)): subtracted once per row (w = (w+1) - 1). */
 static inline void gemm_asum(const int8_t *act, size_t as, int full, int32_t corr[GEMM_TB]) {
-    const __m256i ones16 = _mm256_set1_epi16(1);
     for (int t = 0; t < GEMM_TB; t++) {
         __m256i s = _mm256_setzero_si256();
-        for (int b = 0; b < full; b += 128)
-            s = _mm256_add_epi32(s, _mm256_madd_epi16(i128_block_asum16(act + (size_t)t * as + b), ones16));
+        for (int b = 0; b < full; b += 128) s = i128_asum_acc(s, act + (size_t)t * as + b);
         corr[t] = hsum_epi32_avx2(s);
     }
 }

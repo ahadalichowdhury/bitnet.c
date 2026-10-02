@@ -132,8 +132,12 @@ static inline float q8_dot(const int8_t *w, const float *ws, const int8_t *x, co
 static inline __m256i q8_block_avx2(const int8_t *w, const int8_t *x) {
     const __m256i wv = _mm256_loadu_si256((const __m256i *)w);
     const __m256i xv = _mm256_loadu_si256((const __m256i *)x);
+#ifdef BITNET_VNNI
+    return BITNET_DPBUSD(_mm256_setzero_si256(), _mm256_abs_epi8(wv), _mm256_sign_epi8(xv, wv));
+#else
     const __m256i p = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(xv, wv));
     return _mm256_madd_epi16(p, _mm256_set1_epi16(1));
+#endif
 }
 
 /* Block sums of 8 consecutive blocks, in block order. */
@@ -165,7 +169,11 @@ static inline float q8_dot(const int8_t *w, const float *ws, const int8_t *x, co
     return q8_reduce8(acc);
 }
 
+#ifdef BITNET_VNNI
+#define Q8_PATH "AVX2 + VNNI (VPDPBUSD)"
+#else
 #define Q8_PATH "AVX2 (MADDUBS)"
+#endif
 
 #else
 
