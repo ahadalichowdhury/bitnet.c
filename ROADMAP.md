@@ -92,6 +92,10 @@ green before merging.
 - [ ] **P11: More models** — SentencePiece `tokenizer.model` (Llama-2 style,
   e.g. 1bitLLM) and SiLU/SwiGLU BitNet checkpoints end to end; 7B-class
   ternary models (exporter + loader for their layouts)
+- [x] **Android build** — `make android` (NDK, arm64-v8a, static CLI +
+  `libbitnet.so`); CI runs the mock suites on the Android binaries under qemu;
+  Termux instructions. Not yet measured on a real phone.
+- [ ] **iOS build** — XCFramework of `libbitnet` for Swift apps
 - [ ] **P12: Packaging** — Homebrew formula, `pyproject.toml` for the Python
   bindings, `make install` (publishing needs the maintainer's accounts)
 
