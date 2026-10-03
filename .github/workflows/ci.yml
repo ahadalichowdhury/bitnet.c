@@ -36,3 +36,26 @@ jobs:
           test -f build/libbitnet.so && test -f build/libbitnet.a
           python3 tools/bitnet.py          # loads libbitnet.so via ctypes; no model -> error path only
           ./tools/download_model.sh --help | head -3
+
+  android:
+    # Cross-compiles for Android arm64 with the runner's NDK, then runs the
+    # mock-model suites on the static Android binaries under qemu-aarch64.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y python3-numpy qemu-user-static
+      - name: Fetch tokenizer (9 MB; model weights not needed)
+        run: |
+          mkdir -p models/hf/bitnet-b1.58-2B-4T
+          curl -sSL --fail -o models/hf/bitnet-b1.58-2B-4T/tokenizer.json \
+            https://huggingface.co/microsoft/bitnet-b1.58-2B-4T/resolve/main/tokenizer.json
+      - name: Build for Android arm64-v8a (NDK)
+        run: |
+          echo "NDK: $ANDROID_NDK_LATEST_HOME"
+          make -j android ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
+          file build-android/bitnet build-android/libbitnet.so
+      - name: Mock-model suites on the Android binaries (qemu-aarch64)
+        run: |
+          build-android/test_dot_product | grep -m1 -o "SDOT[^|]*"     # the NEON + SDOT path is running
+          QEMU_CPU=max make android-test-mock ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
