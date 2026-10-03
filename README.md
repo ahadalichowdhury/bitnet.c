@@ -188,6 +188,39 @@ with BitNet() as llm:
 Run `make lib && python3 tools/bitnet.py` for its self-test. Leaving a
 `generate` loop early cancels the generation in C.
 
+## Android
+
+bitnet.c runs on 64-bit ARM phones with the same NEON kernels as Apple
+Silicon. The model needs about 0.9 GB of RAM. Two ways to run it:
+
+**Termux (no app needed).** Install [Termux](https://f-droid.org/packages/com.termux/)
+from F-Droid, then build on the phone:
+
+```sh
+pkg install clang make git
+git clone https://github.com/ahadalichowdhury/bitnet.c.git && cd bitnet.c && make -j
+```
+
+Convert the model on a computer (`./tools/download_model.sh`) and copy
+`models/bitnet_2b4t.bitnet` and `models/hf/bitnet-b1.58-2B-4T/tokenizer.json`
+to the same paths on the phone, then run `./bitnet -i --threads 4`. Four
+threads keeps the work on the fast cores of most phone CPUs.
+
+**Cross-compiling with the Android NDK.**
+
+```sh
+make android ANDROID_NDK=/path/to/android-ndk   # -> build-android/
+adb push build-android/bitnet /data/local/tmp/   # static binary, no dependencies
+```
+
+`build-android/libbitnet.so` is the library for apps: call the `bitnet.h` C
+API from Kotlin/Java through a small JNI wrapper, and store the model as a
+plain file in app storage (it is memory-mapped, so not compressed inside the
+APK). The default target is ARMv8.2 with the dot-product extension (phones
+since about 2018); `ANDROID_ARCH=armv8-a` builds for older cores. CI
+cross-builds with the NDK and runs the mock-model suites on the Android
+binaries under qemu-aarch64.
+
 ## Development
 
 ```sh
