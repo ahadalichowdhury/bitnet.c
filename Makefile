@@ -30,6 +30,14 @@ else
 CPUFLAG := -march=native
 endif
 CFLAGS   ?= -O3 $(CPUFLAG) -Wall -Wextra -std=c11
+# Android's libc (bionic) has pthreads built in and ships no libpthread
+# (building natively in Termux, or cross-building with `make android`).
+ifeq ($(shell uname -o 2>/dev/null),Android)
+LDLIBS   ?= -lm
+else
+LDLIBS   ?= -lpthread -lm
+endif
+EXE_LDFLAGS ?=
 CPPFLAGS += -Iinclude -Isrc -Itests
 DEPFLAGS  = -MMD -MP
 SANFLAGS  = -O1 -g $(CPUFLAG) -Iinclude -Isrc -Itests -Wall -Wextra -std=c11 -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -47,7 +55,8 @@ OBJ   := $(BUILD)/obj
 LIB_SRC := src/bitnet.c src/generate.c src/transformer.c src/threadpool.c src/model_loader.c src/tokenizer.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(OBJ)/%.o)
 LIB     := $(BUILD)/libbitnet.a
-ifeq ($(shell uname -s),Darwin)
+TARGET_OS ?= $(shell uname -s)
+ifeq ($(TARGET_OS),Darwin)
 SHLIB       := $(BUILD)/libbitnet.dylib
 SHLIB_FLAGS := -dynamiclib -install_name @rpath/libbitnet.dylib
 else
@@ -59,7 +68,7 @@ TESTS := $(BUILD)/test_dot_product $(BUILD)/test_gemv $(BUILD)/test_bitlinear \
          $(BUILD)/test_loader $(BUILD)/test_tokenizer $(BUILD)/test_transformer \
          $(BUILD)/test_generate $(BUILD)/test_api $(BUILD)/bench_llama
 
-.PHONY: all lib tests test test-mock bench asan leaks clean
+.PHONY: all lib tests test test-mock bench asan leaks clean android android-test-mock
 
 # The CLI is ./bitnet for the default build; variant builds (make BUILD=...)
 # write $(BUILD)/bitnet so they never overwrite the main binary.
@@ -94,34 +103,60 @@ $(LIB): $(LIB_OBJ)
 	ar rcs $@ $^
 
 $(SHLIB): $(LIB_OBJ)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $^ $(LDLIBS) -o $@
 
 # The CLI binary: ./bitnet (or $(BUILD)/bitnet for variant builds)
 $(CLI): $(OBJ)/main.o $(LIB)
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 
 # ---- test programs ----------------------------------------------------------
 
 $(BUILD)/test_dot_product: $(OBJ)/test_dot_product.o
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 $(BUILD)/test_gemv: $(OBJ)/test_gemv.o
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 $(BUILD)/test_bitlinear: $(OBJ)/test_bitlinear.o
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 $(BUILD)/test_loader: $(OBJ)/test_loader.o $(OBJ)/model_loader.o
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 $(BUILD)/test_tokenizer: $(OBJ)/test_tokenizer.o $(OBJ)/tokenizer.o $(OBJ)/threadpool.o
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 $(BUILD)/test_transformer: $(OBJ)/test_transformer.o $(OBJ)/transformer.o $(OBJ)/threadpool.o \
                             $(OBJ)/model_loader.o $(OBJ)/tokenizer.o
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 $(BUILD)/bench_llama: $(OBJ)/bench_llama.o $(OBJ)/transformer.o $(OBJ)/threadpool.o $(OBJ)/model_loader.o
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 $(BUILD)/test_generate: $(OBJ)/test_generate.o $(OBJ)/generate.o $(OBJ)/transformer.o \
                          $(OBJ)/threadpool.o $(OBJ)/model_loader.o $(OBJ)/tokenizer.o
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
 $(BUILD)/test_api: $(OBJ)/test_api.o $(LIB)
-	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $^ $(LDLIBS) -o $@
+
+# ---- Android (arm64-v8a) cross build with the NDK ------------------------------
+#   make android ANDROID_NDK=/path/to/android-ndk     -> build-android/
+# Executables are linked statically (copy with `adb push` and run, no
+# dependencies); build-android/libbitnet.so is for apps (JNI). The default
+# ANDROID_ARCH targets ARMv8.2 + dot product (SDOT): phones since ~2018
+# (Cortex-A55/A75 and later). ANDROID_ARCH=armv8-a builds for older cores
+# (the NEON kernels then use the slower non-SDOT path).
+ANDROID_NDK  ?= $(or $(ANDROID_NDK_HOME),$(ANDROID_NDK_ROOT),$(ANDROID_NDK_LATEST_HOME))
+ANDROID_API  ?= 24
+ANDROID_ARCH ?= armv8.2-a+dotprod
+NDK_HOST     := $(if $(filter Darwin,$(shell uname -s)),darwin-x86_64,linux-x86_64)
+ANDROID_CC    = $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(NDK_HOST)/bin/aarch64-linux-android$(ANDROID_API)-clang
+ANDROID_VARS  = BUILD=build-android CC="$(ANDROID_CC)" TARGET_OS=Android LDLIBS="-lm" \
+                EXE_LDFLAGS="-static" CFLAGS="-O3 -march=$(ANDROID_ARCH) -Wall -Wextra -std=c11"
+
+android:
+	@test -n "$(ANDROID_NDK)" || { echo "set ANDROID_NDK=/path/to/android-ndk (or ANDROID_NDK_HOME)"; exit 1; }
+	@test -x "$(ANDROID_CC)" || { echo "NDK compiler not found: $(ANDROID_CC)"; exit 1; }
+	$(MAKE) $(ANDROID_VARS) all
+	@echo "== Android build: build-android/bitnet (static CLI), build-android/libbitnet.so, build-android/test_*"
+
+# Runs the mock suites on the Android binaries (needs an arm64 Android device
+# environment, or qemu-user with binfmt on Linux, as in CI).
+android-test-mock: android
+	$(MAKE) $(ANDROID_VARS) test-mock
 
 # ---- running ----------------------------------------------------------------
 
