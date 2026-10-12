@@ -10,7 +10,7 @@ A dependency-free C11 inference engine for **BitNet b1.58** ternary models
 (`{-1, 0, +1}` weights), hand-tuned for Apple Silicon with ARM NEON, with AVX2
 kernels for Intel/AMD x86-64. It runs
 [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
-at **~40 tokens/s on an M1** in **~930 MB of RAM**, with output matching an independent float64
+at **~40 tokens/s on an M1** in **~0.9 GiB of RAM**, with output matching an independent float64
 reference of the Hugging Face implementation.
 
 ```
@@ -25,7 +25,7 @@ The capital of Japan is Tokyo.
 git clone https://github.com/ahadalichowdhury/bitnet.c.git && cd bitnet.c
 make
 
-# 2. Download the model (~1.2 GB, resumable) and convert it to an 851 MB .bitnet (needs numpy)
+# 2. Download the model (~1.2 GB, resumable) and convert it to an 851 MiB .bitnet (needs numpy)
 ./tools/download_model.sh
 
 # 3. Run
@@ -44,17 +44,18 @@ More ways to run it:
 
 ## Performance
 
-Apple M1 (8 GB, 4 performance + 4 efficiency cores, 8 threads), `bitnet-b1.58-2B-4T`:
+Apple M1 (8 GB, 4 performance + 4 efficiency cores), `bitnet-b1.58-2B-4T`, all
+8 threads, measured with `./bitnet --bench` (real text, sampling included):
 
 | Metric | Result |
 |---|---|
 | Decode throughput | **~40 tokens/s** (40 tok/s at short context, 36 tok/s at ~500 tokens) |
 | Model load (mmap + validation) | **0.27 ms**, zero-copy (+0.03 MiB resident until weights are touched) |
 | Time to first token | ~0.15 s for a short chat prompt (warm) |
-| Prompt prefill | **~150 tokens/s** (batched, 16 tokens per weight pass) |
-| Model file | **851 MB** (ternary weights + int8 embeddings; 1125 MB with `--embed-dtype f16`) |
+| Prompt prefill | **~150 tokens/s** (443-token prompt, batched; 120-160 across runs) |
+| Model file | **851 MiB** (ternary weights + int8 embeddings; 1125 MiB with `--embed-dtype f16`) |
 | Heap allocations per token | **0** (measured on all threads during forward passes and `generate()`) |
-| Peak memory | **~930 MB** resident (851 MB memory-mapped weights + KV cache in use) |
+| Peak memory | **~0.9 GiB** resident (851 MiB memory-mapped weights + KV cache in use) |
 | Binary size | 140 KB CLI, 123 KB shared library |
 
 Reproduce with `./bitnet --bench`. Correctness: identical top-1 predictions to a
@@ -79,7 +80,10 @@ decoded one at a time; random tokens, warm-up excluded, 5 repetitions):
 | Xeon Platinum 8375C (4 vCPU), tg128 | 22.0 ± 1.0 | 16.1 ± 0.1 | **1.36x** |
 | model file | 851 MiB | 1133 MiB | |
 
-4 threads is bitnet.cpp's best setting on the M1 (8 threads: 91 / 19 t/s). On
+These are `bench_llama` numbers at 4 threads with random tokens, so they differ
+from the `./bitnet --bench` table above (8 threads, real text, a 443-token
+prompt, sampling included). 4 threads is bitnet.cpp's best setting on the M1
+(8 threads: 91 / 19 t/s). On
 x86, bitnet.c uses VNNI (`VPDPBUSD`) where the CPU has it and AVX2 otherwise.
 Run the script on your own machine for its numbers; `--help` documents the
 methodology and why bitnet.cpp is pinned to a March 2026 commit.
@@ -191,7 +195,7 @@ Run `make lib && python3 tools/bitnet.py` for its self-test. Leaving a
 ## Android
 
 bitnet.c runs on 64-bit ARM phones with the same NEON kernels as Apple
-Silicon. The model needs about 0.9 GB of RAM. Two ways to run it:
+Silicon. The model needs about 0.9 GiB of RAM. Two ways to run it:
 
 **Termux (no app needed).** Install [Termux](https://f-droid.org/packages/com.termux/)
 from F-Droid, then build on the phone:
