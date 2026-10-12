@@ -224,6 +224,17 @@ On x86-64 the Makefile adds `-mavx2 -mfma` (use `make X86_SIMD=` on CPUs without
 AVX2). `-DBITNET_FORCE_SCALAR` and `-DBITNET_PORTABLE` force the scalar and non-Apple
 code paths on a Mac for testing. See `ROADMAP.md` for the 8 build steps.
 
+## Acknowledgements
+
+- Microsoft's BitNet team for the
+  [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) model and
+  [bitnet.cpp](https://github.com/microsoft/BitNet), which the benchmarks compare against.
+- Hugging Face `transformers`, whose BitNet implementation the independent float64
+  reference (`tools/reference_bitnet.py`) follows, and `tokenizers`, which generates
+  the tokenizer golden tests.
+- [Claude Code](https://claude.com/claude-code), which I used as a pair programmer.
+  Design decisions, benchmarking and verification are mine.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE). Model weights are not
