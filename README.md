@@ -51,8 +51,8 @@ Apple M1 (8 GB, 4 performance + 4 efficiency cores), `bitnet-b1.58-2B-4T`, all
 |---|---|
 | Decode throughput | **~40 tokens/s** (40 tok/s at short context, 36 tok/s at ~500 tokens) |
 | Model load (mmap + validation) | **0.27 ms**, zero-copy (+0.03 MiB resident until weights are touched) |
-| Time to first token | ~0.15 s for a short chat prompt (warm) |
-| Prompt prefill | **~150 tokens/s** (443-token prompt, batched; 120-160 across runs) |
+| Time to first token | ~0.13-0.15 s for a short chat prompt (warm) |
+| Prompt prefill | **~150-185 tokens/s** (443-token prompt, batched; varies with load and power) |
 | Model file | **851 MiB** (ternary weights + int8 embeddings; 1125 MiB with `--embed-dtype f16`) |
 | Heap allocations per token | **0** (measured on all threads during forward passes and `generate()`) |
 | Peak memory | **~0.9 GiB** resident (851 MiB memory-mapped weights + KV cache in use) |
