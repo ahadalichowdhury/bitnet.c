@@ -6,6 +6,8 @@
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-ARM%20NEON-black.svg)](#architecture)
 [![x86-64](https://img.shields.io/badge/x86--64-AVX2-blue.svg)](#architecture)
 
+![bitnet.c running on an M1](docs/demo.gif)
+
 A dependency-free C11 inference engine for **BitNet b1.58** ternary models
 (`{-1, 0, +1}` weights), hand-tuned for Apple Silicon with ARM NEON, with AVX2
 kernels for Intel/AMD x86-64. It runs
